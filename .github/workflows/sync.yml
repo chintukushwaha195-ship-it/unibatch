@@ -2,7 +2,7 @@ name: Auto Sync
 
 on:
   schedule:
-    - cron: "0,30 * * * *"
+    - cron: "*/15 * * * *"   # Every 15 minutes
   workflow_dispatch:
 
 jobs:
