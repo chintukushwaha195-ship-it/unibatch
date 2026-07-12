@@ -860,22 +860,8 @@ function App() {
   };
 
   useEffect(() => {
-  const tick = async () => {
-    try {
-      await fetch("/api/sync", {
-        method: "POST",
-      });
-
-      await load();
-    } catch (e) {
-      console.error(e);
-    }
-  };
-
-  tick();
-
-  const t = setInterval(tick, 15000);
-
+  load();
+  const t = setInterval(load, 15000);
   return () => clearInterval(t);
 }, []);
 
