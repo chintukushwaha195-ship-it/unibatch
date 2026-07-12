@@ -17,7 +17,7 @@ const DEFAULT_GOAL = 250;
 const SYNC_INTERVAL_MS = 15 * 1000; // 2 minutes
 const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const BSC_RPC_URLS = ['https://bsc-pokt.nodies.app', 'https://1rpc.io/bnb'];
-const MAX_LOG_CHUNK = 240;
+const MAX_LOG_CHUNK = 50;
 const MAX_CHUNKS_PER_SYNC = 8;
 
 async function rpcCall(method, params) {
