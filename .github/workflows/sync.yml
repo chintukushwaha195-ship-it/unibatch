@@ -1,0 +1,15 @@
+name: Auto Sync
+
+on:
+  schedule:
+    - cron: "0,30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Call Sync API
+        run: |
+          curl -X POST https://unibatch.vercel.app/api/sync
