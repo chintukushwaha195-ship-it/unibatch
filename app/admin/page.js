@@ -216,6 +216,7 @@ export default function AdminDashboard() {
                         <div className="flex items-center gap-2 flex-wrap">
                           <span className="font-semibold text-white">{c.name || c.nickname || <span className="text-white/40 italic">unnamed</span>}</span>
                           <Badge className={c.source === 'onchain' ? 'bg-cyan-500/15 text-cyan-300 border-cyan-400/30' : 'bg-sky-500/15 text-sky-300 border-sky-400/30'}>{c.source}</Badge>
+                          {c.verified === false && <Badge className="bg-amber-500/15 text-amber-300 border-amber-400/30">unverified — check before approving</Badge>}
                           {c.approved && <Badge className="bg-emerald-500/15 text-emerald-300 border-emerald-400/30">approved</Badge>}
                           {c.highlighted && <Badge className="bg-gold-400/15 text-gold-400 border-gold-400/30">pinned</Badge>}
                           {c.hidden && <Badge className="bg-rose-500/15 text-rose-300 border-rose-400/30">hidden</Badge>}
