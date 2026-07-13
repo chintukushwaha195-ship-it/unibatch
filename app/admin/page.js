@@ -18,10 +18,14 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Progress } from '@/components/ui/progress';
 import { toast } from 'sonner';
 
-const getToken = () => (typeof window !== 'undefined' ? localStorage.getItem('unibatch_admin_token') : null);
+/**
+ * All admin API calls use credentials:'include' so the Secure HttpOnly
+ * session cookie is sent automatically — no token stored in localStorage.
+ */
 const authFetch = (url, opts = {}) => fetch(url, {
   ...opts,
-  headers: { ...(opts.headers || {}), Authorization: `Bearer ${getToken()}`, 'Content-Type': 'application/json' },
+  credentials: 'include',
+  headers: { ...(opts.headers || {}), 'Content-Type': 'application/json' },
 });
 
 export default function AdminDashboard() {
@@ -57,16 +61,19 @@ export default function AdminDashboard() {
 
   useEffect(() => {
     (async () => {
-      const t = getToken();
-      if (!t) return router.replace('/admin-login');
-      const res = await fetch('/api/admin/me', { headers: { Authorization: `Bearer ${t}` } });
-      if (!res.ok) { localStorage.removeItem('unibatch_admin_token'); return router.replace('/admin-login'); }
+      const res = await fetch('/api/admin/me', { credentials: 'include' });
+      if (!res.ok) return router.replace('/admin-login');
       setReady(true);
       loadAll();
     })();
   }, [router, loadAll]);
 
-  const logout = () => { localStorage.removeItem('unibatch_admin_token'); router.replace('/admin-login'); };
+  const logout = async () => {
+    try {
+      await fetch('/api/admin/logout', { method: 'POST', credentials: 'include' });
+    } catch { /* ignore */ }
+    router.replace('/admin-login');
+  };
 
   const patchContrib = async (id, patch) => {
     try {
@@ -78,7 +85,6 @@ export default function AdminDashboard() {
       loadAll();
     } catch (e) { toast.error(e.message); }
   };
-
 
   const saveGoal = async () => {
     try {
@@ -144,7 +150,7 @@ export default function AdminDashboard() {
             <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-sky-400 to-gold-400 flex items-center justify-center font-bold text-navy-950 text-sm">U</div>
             <div>
               <div className="text-sm font-bold">UNIBATCH Admin</div>
-              <div className="text-[10px] text-white/50 uppercase tracking-widest">Dashboard · admin001</div>
+              <div className="text-[10px] text-white/50 uppercase tracking-widest">Dashboard</div>
             </div>
           </div>
           <div className="flex gap-2">
