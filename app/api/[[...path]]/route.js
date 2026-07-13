@@ -40,6 +40,44 @@ async function rpcCall(method, params) {
 
 function paddedAddr(addr) { return '0x' + '0'.repeat(24) + addr.toLowerCase().slice(2); }
 
+function decodeTransferAmount(dataHex) {
+  const raw = BigInt(dataHex);
+  const divisor = BigInt(10) ** BigInt(18);
+  const whole = raw / divisor;
+  const frac = raw % divisor;
+  const fracStr = frac.toString().padStart(18, '0').slice(0, 6);
+  return parseFloat(`${whole.toString()}.${fracStr}`) || 0;
+}
+
+// Verifies a single user-submitted txHash actually contains a USDT(BEP20) transfer
+// to our wallet, by reading the real on-chain receipt. Never trusts the client amount.
+async function verifyTxOnChain(wallet, txHash) {
+  try {
+    if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) return null;
+    const receipt = await rpcCall('eth_getTransactionReceipt', [txHash]);
+    if (!receipt || !receipt.logs || receipt.status !== '0x1') return null;
+    const walletPadded = paddedAddr(wallet);
+    for (const log of receipt.logs) {
+      if (
+        log.address?.toLowerCase() === USDT_BEP20_CONTRACT.toLowerCase() &&
+        log.topics?.[0]?.toLowerCase() === TRANSFER_TOPIC.toLowerCase() &&
+        log.topics?.[2]?.toLowerCase() === walletPadded.toLowerCase()
+      ) {
+        const amount = decodeTransferAmount(log.data);
+        if (amount <= 0) continue;
+        return {
+          amount,
+          fromAddress: '0x' + log.topics[1].slice(-40),
+          blockNumber: parseInt(log.blockNumber, 16),
+        };
+      }
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
 let client;
 let db;
 async function getDb() {
@@ -317,15 +355,8 @@ async function syncBscScan(database, force = false) {
 
       for (const log of logs) {
         const txHash = log.transactionHash;
-        const existing = await contribs.findOne({ txHash });
-        if (existing) continue;
         const fromAddr = '0x' + log.topics[1].slice(-40);
-        const raw = BigInt(log.data);
-        const divisor = BigInt(10) ** BigInt(18);
-        const whole = raw / divisor;
-        const frac = raw % divisor;
-        const fracStr = frac.toString().padStart(18, '0').slice(0, 6);
-        const amount = parseFloat(`${whole.toString()}.${fracStr}`) || 0;
+        const amount = decodeTransferAmount(log.data);
         if (amount <= 0) continue;
 
         if (!blockTsCache.has(log.blockNumber)) {
@@ -335,6 +366,27 @@ async function syncBscScan(database, force = false) {
           } catch { blockTsCache.set(log.blockNumber, new Date()); }
         }
         const timestamp = blockTsCache.get(log.blockNumber);
+        const blockNumber = parseInt(log.blockNumber, 16);
+
+        const existing = await contribs.findOne({ txHash });
+        if (existing) {
+          // A form submission already claimed this txHash before we scanned it.
+          // Overwrite whatever amount the user typed with the real on-chain amount,
+          // and only now make it public.
+          if (!existing.verified) {
+            await contribs.updateOne({ id: existing.id }, {
+              $set: {
+                amount, fromAddress: fromAddr, blockNumber,
+                createdAt: timestamp.toISOString(), session: sessionLabelFromUtc(timestamp),
+                verified: true, hidden: false, approved: true,
+                source: existing.name || existing.nickname ? 'form+onchain' : 'onchain',
+              },
+            });
+            inserted++;
+          }
+          continue;
+        }
+
         const seq = (await contribs.countDocuments({})) + 1;
         const doc = {
           id: uuidv4(),
@@ -344,12 +396,13 @@ async function syncBscScan(database, force = false) {
           amount,
           txHash,
           fromAddress: fromAddr,
-          blockNumber: parseInt(log.blockNumber, 16),
+          blockNumber,
           session: sessionLabelFromUtc(timestamp),
           createdAt: timestamp.toISOString(),
-          approved: false, // hidden until admin approves
+          approved: false, // name stays hidden until admin approves; amount still counts (it's real on-chain money)
           highlighted: false,
           hidden: false,
+          verified: true,
           source: 'onchain',
         };
         await contribs.insertOne(doc);
@@ -431,39 +484,69 @@ async function handle(request, { params }) {
       const name = (body.name || '').toString().slice(0, 60).trim();
       const nickname = (body.nickname || '').toString().slice(0, 40).trim();
       const txHash = (body.txHash || '').toString().slice(0, 120).trim();
-      const amount = Math.max(0, Number(body.amount) || 0);
+      const claimedAmount = Math.max(0, Number(body.amount) || 0);
       if (!name && !nickname) return json({ error: 'Name or nickname required' }, 400);
-      if (amount <= 0) return json({ error: 'Amount must be greater than 0' }, 400);
+      if (claimedAmount <= 0) return json({ error: 'Amount must be greater than 0' }, 400);
       const contribs = database.collection('contributors');
+      const settings = await getSettings(database);
+      const wallet = settings.primaryWallet || DEFAULT_WALLET;
+      const now = new Date();
 
-      // If a matching on-chain entry exists (same tx hash), just attach the name and approve
       if (txHash) {
         const existing = await contribs.findOne({ txHash });
         if (existing) {
-          await contribs.updateOne({ id: existing.id }, { $set: { name, nickname, source: existing.source || 'form+onchain' } });
-          return json({ ok: true, contributor: { ...existing, name, nickname } });
+          // Same tx already known (submitted before, or already picked up by on-chain sync).
+          // Just attach the name — never touch the amount here.
+          await contribs.updateOne({ id: existing.id }, { $set: { name, nickname } });
+          const updated = await contribs.findOne({ id: existing.id });
+          return json({
+            ok: true,
+            contributor: updated,
+            message: updated.verified
+              ? `Verified! You're contributor ${updated.displayId}.`
+              : 'Received — this will appear once we verify it on-chain.',
+          });
         }
+
+        // Try to verify THIS tx right now against real on-chain data.
+        const onchain = await verifyTxOnChain(wallet, txHash);
+        if (onchain) {
+          const seq = (await contribs.countDocuments({})) + 1;
+          const doc = {
+            id: uuidv4(), displayId: pad6(seq), seq,
+            name, nickname,
+            amount: onchain.amount, // real on-chain amount — the typed amount is ignored
+            txHash, fromAddress: onchain.fromAddress, blockNumber: onchain.blockNumber,
+            session: sessionLabelFromUtc(now),
+            createdAt: now.toISOString(),
+            approved: true, highlighted: false, hidden: false,
+            verified: true, source: 'form+onchain',
+          };
+          await contribs.insertOne(doc);
+          return json({ ok: true, contributor: doc, message: `Verified! You're contributor ${doc.displayId}.` });
+        }
+        // txHash given but not verifiable yet (not mined / wrong wallet / wrong tx) — fall through to pending
       }
 
+      // No txHash, or it couldn't be verified yet: hold it out of the public wall and out of
+      // the raised total until it's either matched by the on-chain sync or an admin checks it manually.
       const seq = (await contribs.countDocuments({})) + 1;
-      const now = new Date();
       const doc = {
-        id: uuidv4(),
-        displayId: pad6(seq),
-        seq,
-        name,
-        nickname,
-        amount,
+        id: uuidv4(), displayId: pad6(seq), seq,
+        name, nickname,
+        amount: claimedAmount, // unverified — for admin reference only, never shown publicly as-is
         txHash,
         session: sessionLabelFromUtc(now),
         createdAt: now.toISOString(),
-        approved: true, // form submissions with names are treated as opt-in
-        highlighted: false,
-        hidden: false,
-        source: 'form',
+        approved: false, highlighted: false, hidden: true,
+        verified: false, source: txHash ? 'form-pending' : 'form-unverified',
       };
       await contribs.insertOne(doc);
-      return json({ ok: true, contributor: doc });
+      return json({
+        ok: true,
+        contributor: doc,
+        message: 'Thanks! This will appear on the wall once verified on-chain (or reviewed by admin).',
+      });
     }
 
     if (route === '/content' && method === 'GET') {
