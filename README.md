@@ -2,27 +2,69 @@
 
 A premium, transparent crypto-based fundraising site built with **Next.js 15**, **MongoDB**, and **Framer Motion**. Every contribution is verified against the real BSC (USDT BEP20) blockchain transaction before it counts — no admin, sync job, or contributor input is ever trusted blindly.
 
-> Live demo (source project): https://unibatch-fund.preview.emergentagent.com
-
 ---
 
 ## Features
 
 - **6-page slider site** — Hero, About, Strategy, Support, Transparency, FAQ
-- **On-chain verified donations** — every submission requires a TX hash. The server reads the real transaction receipt directly from a BSC public JSON-RPC node and decodes the actual transferred amount — there is no amount field for a contributor to type or fake.
-- **Public contributor wall** — auto-generated sequential IDs (`#000001`, `#000002` …), UTC session labels (Morning / Afternoon / Evening / Night)
-- **Name held back from public view until admin approval** — a verified donation's *amount* counts toward the goal immediately (it's real, verified money), but the contributor's *name* only appears on the wall after an admin reviews and approves it. This stops anyone from getting an inappropriate name onto the public wall automatically.
-- **Anti tx-hash-replay protections**:
-  - A tx hash can only ever be claimed by one name — a second person submitting someone else's already-claimed tx hash is rejected, not allowed to overwrite it.
-  - The public form only accepts tx hashes from the last 3 hours, so nobody can dig up an old, unrelated real transfer off public BscScan and claim it as their own. (Admin's manual review has no such limit — see below.)
-- **No auto-sync / no cron / no background wallet scanning** — verification only happens (a) when a contributor submits a tx hash, or (b) when an admin manually links one from the dashboard. Nothing runs on a timer, and nothing runs just because someone opened a page.
-- **Admin panel** at `/admin-login` — JWT auth (HS256, native `node:crypto`, no external auth service)
-  - Approve / hide / pin contributors
-  - Manually verify & link a tx hash to a claim that came in without one, or wasn't verifiable yet (no age limit — a human is checking it)
-  - Edit About Me, Strategy, Transparency, and FAQ content live
-  - Change goal amount, primary wallet, add secondary networks
+- **On-chain verified donations** — every submission requires a TX hash. The server reads the real transaction receipt directly from a BSC public JSON-RPC node and decodes the actual transferred amount.
+- **Public contributor wall** — auto-generated sequential IDs (`#000001`, `#000002` …), UTC session labels
+- **Name held back from public view until admin approval**
+- **Anti tx-hash-replay protections** — unique index on txHash; 3-hour age gate on self-serve submissions
+- **Admin panel** at `/admin-login` — Phase 1 secure two-factor authentication (see below)
 - **Legal disclaimer** page at `/legal`
-- **Fully responsive** — mobile-first, dark theme, glass cards, floating candlestick background per page
+- **Fully responsive** — mobile-first, dark theme, glass cards, floating candlestick background
+
+---
+
+## Phase 1 — Secure Authentication
+
+Phase 1 replaces the original plaintext-password / localStorage-token system with a production-grade two-factor login flow.
+
+### What changed
+
+| Area | Before (v1.0) | After Phase 1 |
+|---|---|---|
+| Password storage | Plaintext `ADMIN_PASS` env var | bcrypt hash (`ADMIN_PASSWORD_HASH`) |
+| Auth token | JWT in `localStorage` | Signed session ID in HttpOnly cookie |
+| Second factor | None | 6-digit OTP via Outlook SMTP |
+| Session count | Multiple allowed | Single active session enforced |
+| Device tracking | None | Browser fingerprint + IP |
+| Rate limiting | None | 15-min lock → 24-h block (password); 7-day block (OTP) |
+
+### Login flow
+
+1. Admin navigates to `/admin-login`, enters username + password.
+2. Server verifies bcrypt hash. On success, generates a cryptographically random 6-digit OTP and emails it to `RECOVERY_EMAIL` via Outlook SMTP (`smtp.office365.com:587`).
+3. Admin enters the 6-digit code (valid for exactly 1 minute).
+4. Server invalidates **all** previous sessions, creates a new one, and sets a `Secure; HttpOnly; SameSite=Strict` cookie. No token is ever stored in `localStorage`.
+
+### Security rules
+
+**Password lockout (per device = fingerprint + IP):**
+- 3 wrong passwords → 15-minute lock. Shows only: _"Try again later."_
+- Remaining lock time is never revealed.
+- If the next login after the lock succeeds, the counter resets completely.
+- Another 3 wrong passwords → 24-hour device block (checked lazily on next attempt).
+
+**OTP lockout:**
+- 3 wrong OTP codes → device blocked for 7 days.
+- The message is always generic: _"Invalid or expired code."_
+
+**General:**
+- Never reveals whether username, password, or OTP was incorrect.
+- Only one admin session may be active at any time. A successful login immediately invalidates all previous sessions.
+- Session IDs are HMAC-signed with `SESSION_SECRET` before being stored in the cookie.
+
+### Configuring the password
+
+Generate a bcrypt hash of your password (cost factor 12):
+
+```bash
+node -e "const b=require('bcryptjs'); b.hash('your-password-here', 12).then(console.log)"
+```
+
+Copy the `$2b$12$...` output into `ADMIN_PASSWORD_HASH` in your environment. Do not store the plaintext password anywhere.
 
 ---
 
@@ -34,8 +76,8 @@ A premium, transparent crypto-based fundraising site built with **Next.js 15**, 
 | UI         | Tailwind CSS, shadcn/ui, Radix, Framer Motion     |
 | Icons      | lucide-react                                      |
 | Database   | MongoDB (via `mongodb` driver, no ORM)            |
-| Auth       | Custom HS256 JWT (native `node:crypto`)           |
-| On-chain   | BSC public JSON-RPC (`bsc-pokt.nodies.app`, `1rpc.io/bnb`) — no API key needed |
+| Auth       | bcrypt password hash + OTP via Outlook SMTP + Secure HttpOnly session cookie |
+| On-chain   | BSC public JSON-RPC — no API key needed           |
 | Hosting    | Vercel (or any Node-hosting: Render, Railway, Fly, self-hosted Docker) |
 
 ---
@@ -45,6 +87,7 @@ A premium, transparent crypto-based fundraising site built with **Next.js 15**, 
 ### Requirements
 - Node.js **>= 18.18**
 - A MongoDB instance (local or Atlas)
+- An Outlook / Microsoft 365 account for SMTP
 
 ### Steps
 
@@ -54,12 +97,15 @@ npm install
 
 # 2. Configure environment
 cp .env.example .env.local
-# then edit .env.local and fill in MONGO_URL, ADMIN_PASS, JWT_SECRET, etc.
+# Edit .env.local — fill in MONGO_URL, ADMIN_USERNAME, ADMIN_PASSWORD_HASH,
+# SMTP_USER, SMTP_PASSWORD, RECOVERY_EMAIL, SESSION_SECRET, JWT_SECRET
 
 # 3. Run dev server
 npm run dev
 # → http://localhost:3000
 ```
+
+> **Local SMTP note:** Outlook may block SMTP from IPs it doesn't recognise. For local testing you can use a service like [Mailtrap](https://mailtrap.io) and temporarily override the SMTP settings, or use an App Password if your Microsoft account supports it.
 
 ### Production build
 
@@ -75,50 +121,17 @@ npm start
 
 1. Push this repo to GitHub / GitLab / Bitbucket.
 2. On https://vercel.com → **New Project** → import the repo.
-3. In the project settings → **Environment Variables**, add:
-   - `MONGO_URL`
-   - `DB_NAME`
-   - `ADMIN_USER`
-   - `ADMIN_PASS`
-   - `JWT_SECRET`
-   - `RECOVERY_EMAIL`
+3. In the project settings → **Environment Variables**, add all variables from `.env.example`:
+   - `MONGO_URL`, `DB_NAME`
+   - `ADMIN_USERNAME`, `ADMIN_PASSWORD_HASH`
+   - `SMTP_USER`, `SMTP_PASSWORD`, `RECOVERY_EMAIL`
+   - `SESSION_SECRET`, `JWT_SECRET`
    - `CORS_ORIGINS` (usually `*` or your domain)
-4. Click **Deploy**. Vercel auto-detects Next.js and runs `npm install && next build`.
-5. After deploy, hit `/admin-login` to confirm access.
+4. Click **Deploy**.
 
-> **MongoDB:** use https://www.mongodb.com/atlas (free tier is enough). Whitelist `0.0.0.0/0` or add Vercel's IP ranges under **Network Access**.
+> **MongoDB Atlas:** whitelist `0.0.0.0/0` or add Vercel's IP ranges under **Network Access**.
 
-There is nothing to schedule or keep warm — no cron, no Vercel Cron job, no background worker. Every request is verified on demand.
-
----
-
-## Deploying elsewhere
-
-### Render / Railway / Fly.io / Docker
-Any host that runs `node` will work.
-
-```bash
-npm install
-npm run build
-npm start   # listens on $PORT (defaults to 3000)
-```
-
-Set the same environment variables as above.
-
-### Self-hosting with Docker
-
-Create a `Dockerfile` (not included by default):
-
-```dockerfile
-FROM node:20-alpine
-WORKDIR /app
-COPY package.json package-lock.json* ./
-RUN npm install --omit=dev
-COPY . .
-RUN npm run build
-EXPOSE 3000
-CMD ["npm", "start"]
-```
+> **Outlook SMTP on Vercel:** Works from Vercel's outbound IPs. If your Microsoft account has MFA, generate an App Password (Microsoft Account → Security → App passwords).
 
 ---
 
@@ -127,8 +140,8 @@ CMD ["npm", "start"]
 ```
 app/
 ├─ api/[[...path]]/route.js   # ALL backend endpoints (public + admin)
-├─ admin/page.js              # Admin dashboard (JWT-protected)
-├─ admin-login/page.js        # Admin sign-in page
+├─ admin/page.js              # Admin dashboard (session-cookie protected)
+├─ admin-login/page.js        # Two-factor admin sign-in (password → OTP)
 ├─ legal/page.js              # Legal disclaimer
 ├─ layout.js                  # Root layout + metadata + favicon
 └─ page.js                    # 6-page slider (Hero / About / Strategy / Support / Transparency / FAQ)
@@ -139,76 +152,37 @@ lib/utils.js                  # cn() helper
 public/strategy/*.png         # Strategy PDF page images
 globals.css                   # Tailwind + custom utilities
 tailwind.config.js            # Brand palette + animations
-next.config.js                # CORS + external MongoDB driver
+next.config.js                # CORS + external packages (mongodb, bcryptjs, nodemailer)
 vercel.json                   # Vercel hints
+.env.example                  # Full environment variable reference (Phase 1)
 ```
 
----
+### MongoDB collections (Phase 1 additions)
 
-## How a contribution gets verified (read this before changing anything)
-
-1. A contributor sends USDT (BEP20) to the site's wallet, then fills the Support form with their **name** and the **TX hash** of that transfer. TX hash is required — there is no amount field, the amount is never typed by a human.
-2. On submit, the server calls `eth_getTransactionReceipt` for that exact tx hash and looks for a `Transfer` log where the token contract is USDT BEP20 and the recipient (`to`) is the site's wallet.
-   - **Match found, tx is recent (< 3 hours old):** the real on-chain amount is saved, and it counts toward the goal **immediately**. The name is saved too, but stays hidden from the public wall until an admin approves it.
-   - **Match found, but tx is older than 3 hours:** rejected with a message asking the contributor to contact admin. (Stops someone copying an old, unrelated real transfer to the wallet off public BscScan and claiming it as their own — tx hashes are public data, so age-gating self-serve claims is the main defense against this.)
-   - **No match / not mined yet:** the submission is stored hidden and unverified, for admin to check manually later.
-3. If someone submits a tx hash that's **already linked to a different name**, the request is rejected outright — it does not silently overwrite the existing contributor's name.
-4. From the admin dashboard, any entry marked `unverified` can have a tx hash attached via **"Link & verify"**. This runs the same on-chain check (with no age limit, since a human is the one confirming it), corrects the amount from the chain, and marks it verified.
-5. Approving a contributor from the admin dashboard only ever affects whether their **name** is shown — it never changes the amount, and it never re-triggers any blockchain check.
-
-There is no periodic wallet scanning: if a donor never fills the form (or never gives admin a tx hash to link), that donation will not appear anywhere. This is intentional — it keeps every number on the site traceable to a specific tx hash someone can click through to BscScan.
+| Collection | Purpose |
+|---|---|
+| `contributors` | Donation records (unchanged) |
+| `settings` | Site config — goal, wallet (unchanged) |
+| `site_content` | CMS content (unchanged) |
+| `wallets` | Additional display wallets (unchanged) |
+| `admin_sessions` | Active admin sessions — TTL index auto-expires |
+| `admin_security` | Per-device rate-limiting state (OTP + password lockouts) |
 
 ---
 
-## Backend API surface
+## How a contribution gets verified
 
-### Public
-
-| Method | Path                    | Description                                                        |
-|--------|-------------------------|----------------------------------------------------------------------|
-| GET    | `/api/stats`            | goal / raised / remaining / count / progress / wallet / network      |
-| GET    | `/api/contributors`     | Public list (name masked to `null` unless approved)                   |
-| POST   | `/api/contributors`     | Form submission: `{ name, txHash }` — verified on-chain before it's stored as counted |
-| GET    | `/api/content`          | Full CMS content (about / strategy / transparency / faq)             |
-
-### Admin (require `Authorization: Bearer <token>`)
-
-| Method | Path                            | Description                                                        |
-|--------|---------------------------------|------------------------------------------------------------------------|
-| POST   | `/api/admin/login`              | `{ username, password }` → `{ token }`                                |
-| GET    | `/api/admin/me`                 | Verify token                                                           |
-| POST   | `/api/admin/recovery`           | Trigger password-recovery email (currently mocked)                     |
-| GET    | `/api/admin/stats`              | Extended stats (pending / approved / hidden …)                        |
-| GET    | `/api/admin/contributors`       | Raw list of all contributors                                           |
-| PATCH  | `/api/admin/contributors/:id`   | Update `{ approved, highlighted, hidden, name, nickname, txHash }` — passing `txHash` verifies & links it on-chain (no age limit) |
-| PATCH  | `/api/admin/content`            | Update any of `about / strategy / transparency / faq`                  |
-| PATCH  | `/api/admin/goal`               | `{ goal: number }`                                                      |
-| GET    | `/api/admin/wallets`            | List secondary wallets                                                 |
-| POST   | `/api/admin/wallets`            | `{ label, network, address }`                                          |
-| DELETE | `/api/admin/wallets/:id`        | Remove a wallet                                                         |
-| PATCH  | `/api/admin/primary-wallet`     | `{ address }` — change the wallet used for verification                |
+1. Contributor sends USDT (BEP20) to the site wallet, then fills the Support form with their name and TX hash.
+2. Server calls `eth_getTransactionReceipt` on-chain and looks for a matching Transfer log.
+   - **Match, tx < 3 hours old:** amount saved and counts toward goal immediately. Name pending admin approval.
+   - **Match, tx > 3 hours old:** rejected — contributor must contact admin.
+   - **No match / not mined:** stored hidden for admin to verify manually.
+3. A tx hash can only ever be linked to one name — duplicate claims are rejected outright.
 
 ---
 
-## MongoDB collections
+## Compatibility
 
-| Collection      | Purpose                                                         |
-|-----------------|-----------------------------------------------------------------|
-| `contributors`  | Every donation row. Fields: `id`, `displayId`, `seq`, `name`, `nickname`, `amount`, `txHash`, `fromAddress`, `blockNumber`, `session`, `createdAt`, `approved` (controls name visibility only), `highlighted`, `hidden` (controls whether it's counted/shown at all), `verified` (on-chain confirmed), `source` (`form+onchain` \| `onchain` \| `form-pending`) |
-| `settings`      | Singleton with `key: 'main'`: `goal`, `primaryWallet`            |
-| `site_content`  | Singleton with `key: 'main'`: `about`, `strategy`, `transparency`, `faq`, `contentVersion` |
-| `wallets`       | Extra display-only wallet rows                                  |
-
-All IDs use UUIDv4. No Mongo `ObjectId` is exposed via the API.
-
----
-
-## Changing the admin password
-
-Update `ADMIN_PASS` in your Vercel env vars (or `.env.local` for dev). Redeploy. Tokens issued before the change remain valid until they expire (7 days by default). To invalidate them all, also rotate `JWT_SECRET`.
-
----
-
-## Copyright
-
-© 2026 Chintu Kushwaha. All original written content, trading journals, strategy write-ups, and website design are original works. See `/legal` for the full disclaimer.
+- ✅ **Vercel** — tested with Next.js 15 App Router. `bcryptjs` and `nodemailer` are pure-Node modules added to `serverExternalPackages`.
+- ✅ **MongoDB Atlas** — no schema changes to existing collections. Two new collections (`admin_sessions`, `admin_security`) are created automatically on first run with appropriate indexes (TTL on sessions, unique on deviceKey).
+- ✅ **Render / Railway / Fly.io / Docker** — any Node ≥ 18.18 host works.

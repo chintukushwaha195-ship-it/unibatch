@@ -2,21 +2,42 @@ import { NextResponse } from 'next/server';
 import { MongoClient } from 'mongodb';
 import { v4 as uuidv4 } from 'uuid';
 import crypto from 'crypto';
+import bcrypt from 'bcryptjs';
+import nodemailer from 'nodemailer';
 
+// ---------- Environment ----------
 const MONGO_URL = process.env.MONGO_URL;
 const DB_NAME = process.env.DB_NAME || 'unibatch';
 const BSCSCAN_API_KEY = process.env.BSCSCAN_API_KEY;
-const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
-const ADMIN_USER = process.env.ADMIN_USER || 'admin001';
-const ADMIN_PASS = process.env.ADMIN_PASS || 'changeme';
+
+// Auth — Phase 1 vars (ADMIN_USER / ADMIN_PASS kept as fallbacks for legacy deployments)
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME || process.env.ADMIN_USER || 'admin001';
+const ADMIN_PASSWORD_HASH = process.env.ADMIN_PASSWORD_HASH || '';
+
+// SMTP (Outlook)
+const SMTP_HOST = 'smtp.office365.com';
+const SMTP_PORT = 587;
+const SMTP_USER = process.env.SMTP_USER || '';
+const SMTP_PASSWORD = process.env.SMTP_PASSWORD || '';
 const RECOVERY_EMAIL = process.env.RECOVERY_EMAIL || '';
 
+// Session signing
+const SESSION_SECRET = process.env.SESSION_SECRET || process.env.JWT_SECRET || 'dev-session-secret-change-me';
+
+// Kept for compatibility — no longer used for auth in Phase 1+
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret';
+
+// ---------- On-chain constants ----------
 const USDT_BEP20_CONTRACT = '0x55d398326f99059fF775485246999027B3197955';
 const DEFAULT_WALLET = '0x815c9aeE32b098f7256A51957E1A4eE7290DF314';
 const DEFAULT_GOAL = 250;
 const TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
 const BSC_RPC_URLS = ['https://bsc-pokt.nodies.app', 'https://1rpc.io/bnb'];
 
+// ---------- Session cookie ----------
+const SESSION_COOKIE = 'unibatch_session';
+
+// ---------- RPC ----------
 async function rpcCall(method, params) {
   let lastErr;
   for (const url of BSC_RPC_URLS) {
@@ -46,16 +67,11 @@ function decodeTransferAmount(dataHex) {
   return parseFloat(`${whole.toString()}.${fracStr}`) || 0;
 }
 
-// Tx hashes are case-insensitive on-chain (0xABC... === 0xabc...), so we must normalize
-// before ever comparing/storing them — otherwise the same tx can be resubmitted with a
-// different letter-case and bypass the duplicate check while still verifying on-chain.
 function normalizeTxHash(raw) {
   const t = (raw || '').toString().trim().toLowerCase();
-  return /^0x[0-9a-f]{64}$/.test(t) ? t : t.slice(0, 120); // keep invalid input as-is (will just fail verify)
+  return /^0x[0-9a-f]{64}$/.test(t) ? t : t.slice(0, 120);
 }
 
-// Verifies a single user-submitted txHash actually contains a USDT(BEP20) transfer
-// to our wallet, by reading the real on-chain receipt. Never trusts the client amount.
 async function verifyTxOnChain(wallet, txHash) {
   try {
     if (!/^0x[0-9a-fA-F]{64}$/.test(txHash)) return null;
@@ -83,6 +99,7 @@ async function verifyTxOnChain(wallet, txHash) {
   }
 }
 
+// ---------- Database ----------
 let client;
 let db;
 async function getDb() {
@@ -90,8 +107,6 @@ async function getDb() {
   client = new MongoClient(MONGO_URL);
   await client.connect();
   db = client.db(DB_NAME);
-  // Belt-and-braces: even if two requests race past the findOne() duplicate check at the
-  // same instant, the DB itself will refuse to store the same (normalized) txHash twice.
   try {
     await db.collection('contributors').createIndex(
       { txHash: 1 },
@@ -100,10 +115,150 @@ async function getDb() {
   } catch (e) {
     console.error('txHash unique index creation failed (non-fatal):', e.message);
   }
+  // Indexes for Phase 1 auth collections
+  try {
+    await db.collection('admin_sessions').createIndex({ sessionId: 1 }, { unique: true });
+    await db.collection('admin_sessions').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+    await db.collection('admin_security').createIndex({ deviceKey: 1 }, { unique: true });
+  } catch {
+    // Non-fatal if indexes already exist
+  }
   return db;
 }
 
-// ---------- JWT helpers ----------
+// ---------- Device / fingerprint helpers ----------
+/**
+ * Derive a stable device key from the client-supplied fingerprint and the
+ * server-observed IP.  Neither alone is sufficient — fingerprint avoids
+ * shared-IP collisions; IP guards against trivially forged fingerprints.
+ */
+function computeDeviceKey(fingerprint, ip) {
+  const data = `${(fingerprint || '').slice(0, 256)}:${ip || 'unknown'}`;
+  return crypto.createHash('sha256').update(data).digest('hex');
+}
+
+function getClientIp(request) {
+  return (
+    request.headers.get('x-forwarded-for')?.split(',')[0]?.trim() ||
+    request.headers.get('x-real-ip') ||
+    'unknown'
+  );
+}
+
+// ---------- Session helpers ----------
+/**
+ * Sign a sessionId so that even if an attacker can enumerate UUIDs they still
+ * cannot craft a valid cookie without SESSION_SECRET.
+ * Cookie value format: <uuid>.<hmac-hex>
+ */
+function signSession(sessionId) {
+  const sig = crypto.createHmac('sha256', SESSION_SECRET).update(sessionId).digest('hex');
+  return `${sessionId}.${sig}`;
+}
+
+function unsignSession(cookieValue) {
+  if (!cookieValue) return null;
+  const dot = cookieValue.lastIndexOf('.');
+  if (dot < 0) return null;
+  const id = cookieValue.slice(0, dot);
+  const sig = cookieValue.slice(dot + 1);
+  const expected = crypto.createHmac('sha256', SESSION_SECRET).update(id).digest('hex');
+  if (sig.length !== expected.length) return null;
+  if (!crypto.timingSafeEqual(Buffer.from(sig, 'hex'), Buffer.from(expected, 'hex'))) return null;
+  return id;
+}
+
+async function validateSession(request, database) {
+  const raw = request.cookies.get(SESSION_COOKIE)?.value;
+  const sessionId = unsignSession(raw);
+  if (!sessionId) return null;
+  const sessions = database.collection('admin_sessions');
+  const session = await sessions.findOne({ sessionId });
+  if (!session) return null;
+  if (new Date(session.expiresAt) < new Date()) {
+    await sessions.deleteOne({ sessionId });
+    return null;
+  }
+  await sessions.updateOne({ sessionId }, { $set: { lastUsedAt: new Date().toISOString() } });
+  return session;
+}
+
+function applySessionCookie(response, sessionId) {
+  response.cookies.set(SESSION_COOKIE, signSession(sessionId), {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'strict',
+    maxAge: 60 * 60 * 24 * 7, // 7 days
+    path: '/',
+  });
+}
+
+function clearSessionCookie(response) {
+  response.cookies.set(SESSION_COOKIE, '', {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'strict',
+    maxAge: 0,
+    path: '/',
+  });
+}
+
+// ---------- SMTP ----------
+async function sendOtpEmail(otp) {
+  const transporter = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: false, // STARTTLS
+    auth: { user: SMTP_USER, pass: SMTP_PASSWORD },
+    tls: { ciphers: 'SSLv3' },
+  });
+  await transporter.sendMail({
+    from: `"UNIBATCH Security" <${SMTP_USER}>`,
+    to: RECOVERY_EMAIL,
+    subject: 'UNIBATCH Admin — Your Login Code',
+    text: [
+      'Your one-time login code is:',
+      '',
+      `  ${otp}`,
+      '',
+      'This code expires in 1 minute. Do not share it with anyone.',
+      'If you did not request this, your password may be compromised.',
+    ].join('\n'),
+    html: `
+      <div style="font-family:sans-serif;max-width:480px;margin:auto">
+        <h2 style="color:#0ea5e9">UNIBATCH Admin Login</h2>
+        <p>Your one-time login code is:</p>
+        <div style="font-size:2rem;font-weight:bold;letter-spacing:0.3em;padding:16px;background:#0f172a;color:#38bdf8;border-radius:8px;text-align:center">${otp}</div>
+        <p style="color:#64748b;font-size:0.875rem">This code expires in <strong>1 minute</strong>. Do not share it with anyone.</p>
+        <p style="color:#64748b;font-size:0.875rem">If you did not request this code, your password may be compromised.</p>
+      </div>
+    `,
+  });
+}
+
+async function sendRecoveryEmail() {
+  const transporter = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: false,
+    auth: { user: SMTP_USER, pass: SMTP_PASSWORD },
+    tls: { ciphers: 'SSLv3' },
+  });
+  await transporter.sendMail({
+    from: `"UNIBATCH Security" <${SMTP_USER}>`,
+    to: RECOVERY_EMAIL,
+    subject: 'UNIBATCH Admin — Password Recovery Request',
+    text: [
+      'A password recovery request was submitted for the UNIBATCH admin panel.',
+      '',
+      'To regain access, update the ADMIN_PASSWORD_HASH environment variable with a new bcrypt hash.',
+      '',
+      'If you did not make this request, someone may be attempting to access your admin panel.',
+    ].join('\n'),
+  });
+}
+
+// ---------- JWT helpers (kept for backward-compat — not used for session auth in Phase 1) ----------
 function b64url(s) { return Buffer.from(s).toString('base64url'); }
 function signJwt(payload, ttlSeconds = 60 * 60 * 24 * 7) {
   const header = { alg: 'HS256', typ: 'JWT' };
@@ -128,11 +283,6 @@ function verifyJwt(token) {
     return payload;
   } catch { return null; }
 }
-function extractToken(request) {
-  const auth = request.headers.get('authorization') || '';
-  const m = auth.match(/^Bearer\s+(.+)$/i);
-  return m ? m[1] : null;
-}
 
 // ---------- Utils ----------
 function sessionLabelFromUtc(date) {
@@ -144,12 +294,18 @@ function sessionLabelFromUtc(date) {
 }
 function pad6(n) { return '#' + String(n).padStart(6, '0'); }
 function cors(res) {
-  res.headers.set('Access-Control-Allow-Origin', '*');
+  res.headers.set('Access-Control-Allow-Origin', process.env.CORS_ORIGINS || '*');
   res.headers.set('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,PATCH,OPTIONS');
   res.headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
   return res;
 }
 function json(data, status = 200) { return cors(NextResponse.json(data, { status })); }
+
+// Mask email for display (e.g. ch***@outlook.com)
+function maskEmail(email) {
+  if (!email) return '***';
+  return email.replace(/^(.{2}).+(@.+)$/, '$1***$2');
+}
 
 // ---------- Settings & Content defaults ----------
 async function getSettings(database) {
@@ -408,8 +564,6 @@ async function handle(request, { params }) {
 
       const existing = await contribs.findOne({ txHash });
       if (existing) {
-        // Same tx already known. Amount was already set from the chain — never touch it here.
-        // Name/nickname get attached but stay behind admin approval, same as any fresh submission.
         await contribs.updateOne({ id: existing.id }, { $set: { name, nickname, approved: false } });
         const updated = await contribs.findOne({ id: existing.id });
         return json({
@@ -421,7 +575,6 @@ async function handle(request, { params }) {
         });
       }
 
-      // Verify THIS tx right now against real on-chain data — never trust a client-supplied amount.
       const onchain = await verifyTxOnChain(wallet, txHash);
       if (onchain) {
         const seq = (await contribs.countDocuments({})) + 1;
@@ -432,9 +585,6 @@ async function handle(request, { params }) {
           txHash, fromAddress: onchain.fromAddress, blockNumber: onchain.blockNumber,
           session: sessionLabelFromUtc(now),
           createdAt: now.toISOString(),
-          // Amount is real (verified on-chain) so it counts toward the goal immediately.
-          // The name is held back until an admin reviews it — stops inappropriate names
-          // from appearing on the public wall instantly.
           approved: false, highlighted: false, hidden: false,
           verified: true, source: 'form+onchain',
         };
@@ -442,31 +592,19 @@ async function handle(request, { params }) {
           await contribs.insertOne(doc);
         } catch (e) {
           if (e?.code === 11000) {
-            // Another request inserted this exact tx in the tiny window between our
-            // findOne() check and this insert — treat it as "already known", don't double-count.
             const raced = await contribs.findOne({ txHash });
-            return json({
-              ok: true,
-              contributor: raced,
-              message: 'Received — this transaction was already recorded.',
-            });
+            return json({ ok: true, contributor: raced, message: 'Received — this transaction was already recorded.' });
           }
           throw e;
         }
-        return json({
-          ok: true,
-          contributor: doc,
-          message: `Verified! Your donation counts toward the goal now — your name will show once reviewed.`,
-        });
+        return json({ ok: true, contributor: doc, message: `Verified! Your donation counts toward the goal now — your name will show once reviewed.` });
       }
 
-      // txHash given but not verifiable yet (not mined / wrong wallet / wrong tx): hold it out of
-      // the public wall and out of the raised total until an admin checks and links it manually.
       const seq = (await contribs.countDocuments({})) + 1;
       const doc = {
         id: uuidv4(), displayId: pad6(seq), seq,
         name, nickname,
-        amount: 0, // unknown until verified — never shown or counted as-is
+        amount: 0,
         txHash,
         session: sessionLabelFromUtc(now),
         createdAt: now.toISOString(),
@@ -482,11 +620,7 @@ async function handle(request, { params }) {
         }
         throw e;
       }
-      return json({
-        ok: true,
-        contributor: doc,
-        message: 'Thanks! This will appear on the wall once verified on-chain (or reviewed by admin).',
-      });
+      return json({ ok: true, contributor: doc, message: 'Thanks! This will appear on the wall once verified on-chain (or reviewed by admin).' });
     }
 
     if (route === '/content' && method === 'GET') {
@@ -503,32 +637,240 @@ async function handle(request, { params }) {
       });
     }
 
-    // ---------------- ADMIN ----------------
+    // ---------------- ADMIN AUTH (Phase 1) ----------------
+
+    /**
+     * Step 1: Password check.
+     * On success: generates a 6-digit OTP, emails it via Outlook SMTP, and returns { step: 'otp' }.
+     * Never reveals whether username, password, or any other field was wrong.
+     *
+     * Lockout rules:
+     *   - 3 wrong passwords in cycle 1  → 15-minute lock  (show "Try again later.")
+     *   - 3 wrong passwords in cycle 2  → 24-hour block   (lazy check)
+     *   - Never reveal remaining lock time.
+     */
     if (route === '/admin/login' && method === 'POST') {
       const body = await request.json();
-      const { username, password } = body || {};
-      if (username !== ADMIN_USER || password !== ADMIN_PASS) {
-        return json({ error: 'Invalid credentials' }, 401);
+      const { username, password, fingerprint } = body || {};
+      const ip = getClientIp(request);
+      const deviceKey = computeDeviceKey(fingerprint, ip);
+      const security = database.collection('admin_security');
+      const now = new Date();
+
+      const sec = await security.findOne({ deviceKey }) || {};
+
+      // --- Active 24-hour device block (lazy check) ---
+      if (sec.pwBlockedUntil && new Date(sec.pwBlockedUntil) > now) {
+        return json({ error: 'Try again later.' }, 429);
       }
-      const token = signJwt({ sub: ADMIN_USER, role: 'admin' });
-      return json({ ok: true, token, user: { username: ADMIN_USER } });
+
+      // --- Active 15-minute lock ---
+      if (sec.pwLockedUntil && new Date(sec.pwLockedUntil) > now) {
+        return json({ error: 'Try again later.' }, 429);
+      }
+
+      // Detect whether 15-min lock has expired → we are now in the second attempt cycle
+      const firstLockExpired = !!(sec.pwLockedUntil && new Date(sec.pwLockedUntil) <= now);
+      const inSecondCycle = firstLockExpired || sec.pwCycle === 2;
+
+      // --- Credential check — use constant-time comparison where possible ---
+      const usernameOk = username === ADMIN_USERNAME;
+      let passwordOk = false;
+      if (ADMIN_PASSWORD_HASH && password) {
+        try {
+          passwordOk = await bcrypt.compare(String(password), ADMIN_PASSWORD_HASH);
+        } catch {
+          passwordOk = false;
+        }
+      }
+
+      if (!usernameOk || !passwordOk) {
+        // Failure path
+        const cycle = inSecondCycle ? 2 : 1;
+        // Reset attempt counter when transitioning from expired first lock to second cycle
+        const prevAttempts = firstLockExpired ? 0 : (sec.pwAttempts || 0);
+        const newAttempts = prevAttempts + 1;
+
+        let pwLockedUntil = firstLockExpired ? null : (sec.pwLockedUntil || null);
+        let pwBlockedUntil = sec.pwBlockedUntil || null;
+
+        if (cycle === 1 && newAttempts >= 3) {
+          // First three failures → 15-minute lock
+          pwLockedUntil = new Date(now.getTime() + 15 * 60 * 1000).toISOString();
+        } else if (cycle === 2 && newAttempts >= 3) {
+          // Second set of three failures → 24-hour block
+          pwBlockedUntil = new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString();
+          pwLockedUntil = null;
+        }
+
+        await security.updateOne(
+          { deviceKey },
+          { $set: { deviceKey, pwAttempts: newAttempts, pwCycle: cycle, pwLockedUntil, pwBlockedUntil, updatedAt: now.toISOString() } },
+          { upsert: true }
+        );
+        // Generic message — never reveal which field was wrong or how many attempts remain
+        return json({ error: 'Invalid credentials. Please try again.' }, 401);
+      }
+
+      // --- Credentials correct: reset password attempt counters ---
+      // Spec: "if the next login succeeds after the 15-minute lock, reset the failed-attempt counter completely."
+      await security.updateOne(
+        { deviceKey },
+        { $set: { pwAttempts: 0, pwCycle: 1, pwLockedUntil: null, updatedAt: now.toISOString() } },
+        { upsert: true }
+      );
+
+      // --- Generate 6-digit OTP ---
+      // Use crypto.randomInt for a cryptographically secure integer
+      const otp = String(crypto.randomInt(100000, 1000000));
+      const otpExpiresAt = new Date(now.getTime() + 60 * 1000).toISOString(); // 1 minute
+
+      await security.updateOne(
+        { deviceKey },
+        { $set: { otpCode: otp, otpExpiresAt, otpAttempts: 0, otpBlockedUntil: null, updatedAt: now.toISOString() } },
+        { upsert: true }
+      );
+
+      // --- Send OTP via Outlook SMTP ---
+      try {
+        await sendOtpEmail(otp);
+      } catch (e) {
+        console.error('[SMTP] Failed to send OTP:', e.message);
+        // Clean up pending OTP so a retry is possible
+        await security.updateOne({ deviceKey }, { $set: { otpCode: null, otpExpiresAt: null } });
+        return json({ error: 'Could not send verification email. Please check SMTP configuration.' }, 500);
+      }
+
+      return json({ ok: true, step: 'otp', sentTo: maskEmail(RECOVERY_EMAIL) });
     }
 
+    /**
+     * Step 2: OTP verification.
+     * On success: invalidates all existing sessions (single-session enforcement),
+     * creates a new session, and sets a Secure HttpOnly SameSite=Strict cookie.
+     *
+     * OTP rules:
+     *   - Exactly 6 digits
+     *   - Valid for exactly 1 minute
+     *   - Maximum 3 incorrect attempts
+     *   - After 3 incorrect attempts → device blocked for 7 days
+     */
+    if (route === '/admin/verify-otp' && method === 'POST') {
+      const body = await request.json();
+      const { otp, fingerprint } = body || {};
+      const ip = getClientIp(request);
+      const deviceKey = computeDeviceKey(fingerprint, ip);
+      const security = database.collection('admin_security');
+      const sessions = database.collection('admin_sessions');
+      const now = new Date();
+
+      const sec = await security.findOne({ deviceKey });
+
+      // No pending OTP for this device
+      if (!sec || !sec.otpCode) {
+        return json({ error: 'Invalid or expired code.' }, 401);
+      }
+
+      // 7-day OTP device block
+      if (sec.otpBlockedUntil && new Date(sec.otpBlockedUntil) > now) {
+        return json({ error: 'Try again later.' }, 429);
+      }
+
+      // OTP expired (1-minute window)
+      if (!sec.otpExpiresAt || new Date(sec.otpExpiresAt) <= now) {
+        await security.updateOne({ deviceKey }, { $set: { otpCode: null, otpAttempts: 0, updatedAt: now.toISOString() } });
+        return json({ error: 'Invalid or expired code.' }, 401);
+      }
+
+      // Check OTP value — compare as strings (both are exactly 6 decimal digits)
+      const otpOk = sec.otpCode === String(otp || '').trim();
+
+      if (!otpOk) {
+        const newAttempts = (sec.otpAttempts || 0) + 1;
+        let otpBlockedUntil = sec.otpBlockedUntil || null;
+        if (newAttempts >= 3) {
+          // 3 incorrect OTP attempts → 7-day device block
+          otpBlockedUntil = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString();
+        }
+        await security.updateOne(
+          { deviceKey },
+          { $set: { otpAttempts: newAttempts, otpBlockedUntil, updatedAt: now.toISOString() } }
+        );
+        // Generic message — never reveal OTP correctness
+        return json({ error: 'Invalid or expired code.' }, 401);
+      }
+
+      // --- OTP correct ---
+
+      // Single-session enforcement: invalidate every existing admin session
+      await sessions.deleteMany({});
+
+      // Clear OTP from security record
+      await security.updateOne(
+        { deviceKey },
+        { $set: { otpCode: null, otpExpiresAt: null, otpAttempts: 0, updatedAt: now.toISOString() } }
+      );
+
+      // Create new session
+      const sessionId = uuidv4();
+      const expiresAt = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000).toISOString();
+      await sessions.insertOne({
+        sessionId,
+        deviceKey,
+        ip,
+        createdAt: now.toISOString(),
+        expiresAt,
+        lastUsedAt: now.toISOString(),
+      });
+
+      // Set Secure HttpOnly SameSite=Strict session cookie
+      const response = NextResponse.json({ ok: true });
+      applySessionCookie(response, sessionId);
+      cors(response);
+      return response;
+    }
+
+    /**
+     * Logout: clear the session cookie and delete the session from DB.
+     */
+    if (route === '/admin/logout' && method === 'POST') {
+      const raw = request.cookies.get(SESSION_COOKIE)?.value;
+      const sessionId = unsignSession(raw);
+      if (sessionId) {
+        await database.collection('admin_sessions').deleteOne({ sessionId });
+      }
+      const response = NextResponse.json({ ok: true });
+      clearSessionCookie(response);
+      cors(response);
+      return response;
+    }
+
+    /**
+     * Password recovery: sends a notification to RECOVERY_EMAIL via SMTP.
+     * Does NOT expose any account details or reset the password automatically.
+     */
     if (route === '/admin/recovery' && method === 'POST') {
-      // MOCKED: no email service configured. Returns success + destination.
-      return json({ ok: true, sentTo: RECOVERY_EMAIL, note: 'Password recovery email is MOCKED for Phase 2 MVP.' });
+      if (!SMTP_USER || !SMTP_PASSWORD || !RECOVERY_EMAIL) {
+        return json({ error: 'Recovery email is not configured. Set SMTP_USER, SMTP_PASSWORD, and RECOVERY_EMAIL.' }, 503);
+      }
+      try {
+        await sendRecoveryEmail();
+        return json({ ok: true, sentTo: maskEmail(RECOVERY_EMAIL) });
+      } catch (e) {
+        console.error('[SMTP] Recovery email failed:', e.message);
+        return json({ error: 'Could not send recovery email.' }, 500);
+      }
     }
 
-    // Everything below requires admin JWT
+    // ---------------- ADMIN (requires valid session cookie) ----------------
     if (route.startsWith('/admin/')) {
-      const token = extractToken(request);
-      const payload = verifyJwt(token);
-      if (!payload || payload.role !== 'admin') {
+      const session = await validateSession(request, database);
+      if (!session) {
         return json({ error: 'Unauthorized' }, 401);
       }
 
       if (route === '/admin/me' && method === 'GET') {
-        return json({ ok: true, user: { username: payload.sub } });
+        return json({ ok: true, user: { username: ADMIN_USERNAME } });
       }
 
       if (route === '/admin/stats' && method === 'GET') {
@@ -561,8 +903,6 @@ async function handle(request, { params }) {
         if (typeof body.nickname === 'string') patch.nickname = body.nickname.slice(0, 40);
 
         let warning = null;
-        // If the admin is attaching a real tx hash to a claim that came in without one (or
-        // wasn't verifiable yet), verify it on-chain now and correct the amount from the chain.
         if (typeof body.txHash === 'string' && body.txHash.trim()) {
           const txHash = normalizeTxHash(body.txHash);
           const current = await database.collection('contributors').findOne({ id });
@@ -576,7 +916,7 @@ async function handle(request, { params }) {
             const onchain = await verifyTxOnChain(wallet, txHash);
             patch.txHash = txHash;
             if (onchain) {
-              patch.amount = onchain.amount; // trust the chain, not whatever was typed
+              patch.amount = onchain.amount;
               patch.fromAddress = onchain.fromAddress;
               patch.blockNumber = onchain.blockNumber;
               patch.verified = true;
@@ -644,7 +984,7 @@ async function handle(request, { params }) {
     }
 
     if (route === '/' || route === '') {
-      return json({ ok: true, service: 'unibatch-api', version: '0.2' });
+      return json({ ok: true, service: 'unibatch-api', version: '0.3' });
     }
 
     return json({ error: 'Not found', route }, 404);

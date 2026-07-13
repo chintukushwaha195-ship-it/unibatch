@@ -7,10 +7,13 @@ const nextConfig = {
       { protocol: 'https', hostname: 'api.qrserver.com', pathname: '/**' },
     ],
   },
-  // Ensure MongoDB driver is treated as an external server-only package
-  serverExternalPackages: ['mongodb'],
+  // Server-only packages — not bundled by Next.js webpack, loaded from node_modules at runtime.
+  // bcryptjs and nodemailer are pure-Node modules; mongodb was already here.
+  serverExternalPackages: ['mongodb', 'bcryptjs', 'nodemailer'],
   async headers() {
     // CORS for the /api/* routes so external clients (mobile / dashboards) can call them.
+    // Note: admin cookie routes (/api/admin/*) are same-origin — CORS headers are irrelevant
+    // for same-origin browser requests and do not interfere with SameSite=Strict cookies.
     return [
       {
         source: '/api/(.*)',
