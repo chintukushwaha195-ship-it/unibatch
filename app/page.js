@@ -539,7 +539,7 @@ function SupportPage({ stats, contributors, refresh, content }) {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed');
-      toast.success(`Thank you! You are contributor ${data.contributor.displayId}`);
+      toast.success(data.message || `Thank you! You are contributor ${data.contributor.displayId}`);
       setForm({ name: '', amount: '', txHash: '' });
       refresh();
     } catch (err) { toast.error(err.message); }
