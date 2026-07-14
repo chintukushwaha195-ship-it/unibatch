@@ -73,6 +73,15 @@ const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 // OTP resend cooldown — independent of any client-supplied value.
 const OTP_RESEND_COOLDOWN_MS = 60 * 1000;
 
+// Password-recovery email rate limiting — independent of any client-supplied
+// value, keyed only on the server-observed IP (ipKey), matching the pattern
+// used for OTP resend above. Prevents unlimited recovery-email spam:
+//   - Minimum gap between any two recovery emails.
+//   - Hard cap on recovery emails sent within a rolling window.
+const RECOVERY_RESEND_COOLDOWN_MS = 60 * 1000;        // 1 minute between sends
+const RECOVERY_MAX_PER_WINDOW     = 5;                 // max sends per window
+const RECOVERY_WINDOW_MS          = 60 * 60 * 1000;    // 1-hour rolling window
+
 // ---------- Simple in-memory IP rate limiter (POST /contributors) ----------
 // Best-effort: resets on cold start, which is acceptable for this limiter's
 // purpose (blunting bursts from a single serverless instance). Combined with
@@ -735,9 +744,12 @@ async function handle(request, { params }) {
       }
 
       // Check SMTP before generating OTP — give a clear error if unconfigured.
+      // Log the specific cause server-side only; the client never learns
+      // which env vars are involved (Fix — previously leaked env var names).
       if (!isSmtpConfigured()) {
+        console.error('[api/login] SMTP is not configured (SMTP_USER / SMTP_PASSWORD / RECOVERY_EMAIL).');
         return json(
-          { error: 'Verification email cannot be sent. SMTP is not configured (SMTP_USER / SMTP_PASSWORD / RECOVERY_EMAIL).' },
+          { error: 'Verification email cannot be sent right now. Please try again later.' },
           503
         );
       }
@@ -884,21 +896,81 @@ async function handle(request, { params }) {
      *
      * Sends password-recovery instructions to RECOVERY_EMAIL.
      * Does NOT reset the password or expose any credentials.
+     *
+     * Rate limiting (Fix — previously unlimited):
+     *  - Keyed ONLY on the server-observed IP (ipKey), same as the OTP
+     *    resend cooldown, so it cannot be bypassed by client-supplied values
+     *    or by omitting them.
+     *  - Minimum 60s gap between any two recovery emails.
+     *  - Hard cap of RECOVERY_MAX_PER_WINDOW sends per rolling window,
+     *    persisted in the DB so it survives cold starts / multiple instances.
+     *  - Only a successful send updates the rate-limit state — a failed
+     *    SMTP attempt does not consume the cooldown or the window quota.
+     *  - Generic 429 messages; no account/email enumeration is possible
+     *    since this route has no user-supplied identifier at all.
      */
     if (route === '/admin/recovery' && method === 'POST') {
+      const ip       = getClientIp(request);
+      const ipKey    = computeIpKey(ip);
+      const security = database.collection('admin_security');
+      const now      = new Date();
+
+      const sec = (await security.findOne({ ipKey })) || {};
+
+      // ---- Minimum gap between recovery emails ----
+      if (sec.recoveryLastSentAt) {
+        const elapsedMs = now.getTime() - new Date(sec.recoveryLastSentAt).getTime();
+        if (elapsedMs < RECOVERY_RESEND_COOLDOWN_MS) {
+          const waitSeconds = Math.ceil((RECOVERY_RESEND_COOLDOWN_MS - elapsedMs) / 1000);
+          return json(
+            { error: `Please wait ${waitSeconds}s before requesting another recovery email.` },
+            429
+          );
+        }
+      }
+
+      // ---- Rolling-window cap ----
+      const windowStart   = sec.recoveryWindowStart ? new Date(sec.recoveryWindowStart) : null;
+      const windowExpired = !windowStart || (now.getTime() - windowStart.getTime()) > RECOVERY_WINDOW_MS;
+      const currentCount  = windowExpired ? 0 : (Number(sec.recoveryCount) || 0);
+
+      if (!windowExpired && currentCount >= RECOVERY_MAX_PER_WINDOW) {
+        return json({ error: 'Too many recovery requests. Please try again later.' }, 429);
+      }
+
+      // Log the specific cause server-side only; the client never learns
+      // which env vars are involved (Fix — previously leaked env var names).
       if (!isSmtpConfigured()) {
+        console.error('[api/recovery] Recovery email is not configured (SMTP_USER / SMTP_PASSWORD / RECOVERY_EMAIL).');
         return json(
-          { error: 'Recovery email is not configured. Set SMTP_USER, SMTP_PASSWORD, and RECOVERY_EMAIL.' },
+          { error: 'Recovery email cannot be sent right now. Please try again later.' },
           503
         );
       }
+
       try {
         await sendRecoveryEmail();
-        return json({ ok: true, sentTo: maskedRecoveryEmail() });
       } catch (e) {
         console.error('[api/recovery] SMTP send failed:', e?.message);
         return json({ error: 'Could not send recovery email. Check SMTP configuration.' }, 500);
       }
+
+      // Record successful send — reset the window if it expired, otherwise increment it.
+      await safeUpsert(
+        security,
+        { ipKey },
+        {
+          $set: {
+            ipKey,
+            recoveryLastSentAt:  now.toISOString(),
+            recoveryWindowStart: windowExpired ? now.toISOString() : (sec.recoveryWindowStart || now.toISOString()),
+            recoveryCount:       windowExpired ? 1 : currentCount + 1,
+            updatedAt:           now.toISOString(),
+          },
+        }
+      );
+
+      return json({ ok: true, sentTo: maskedRecoveryEmail() });
     }
 
     // ========================================================
