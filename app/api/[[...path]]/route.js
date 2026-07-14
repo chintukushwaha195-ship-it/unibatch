@@ -600,27 +600,13 @@ async function handle(request, { params }) {
         });
       }
 
-      // Not yet found on-chain — store pending for admin review
-      const doc = {
-        id: uuidv4(), displayId: pad6(seq), seq,
-        name, nickname,
-        amount: 0,
-        txHash,
-        session:   sessionLabelFromUtc(now),
-        createdAt: now.toISOString(),
-        approved: false, highlighted: false, hidden: true,
-        verified: false, source: 'form-pending',
-      };
-      try {
-        await col.insertOne(doc);
-      } catch (e) {
-        if (e?.code === 11000) {
-          const raced = await col.findOne({ txHash });
-          return json({ ok: true, contributor: raced, message: 'Received — already recorded.' });
-        }
-        throw e;
-      }
-      return json({ ok: true, contributor: doc, message: 'Thanks! This will appear once verified on-chain or reviewed by admin.' });
+      // Not found on-chain at all — either a fake/malformed hash or a
+      // transaction sent to a different wallet. Reject at submission
+      // time instead of creating a junk entry for admin review.
+      return json(
+        { error: 'We could not find this transaction on the blockchain for our wallet address. Please double-check the hash and try again.' },
+        400
+      );
     }
 
     // GET /content
