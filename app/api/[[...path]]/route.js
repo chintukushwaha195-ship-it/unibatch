@@ -112,7 +112,27 @@ async function safeUpsert(collection, filter, update) {
       // Another concurrent request just inserted the same document —
       // the row now exists, so a plain update (still upsert:true as a
       // belt-and-suspenders) will succeed.
-      return collection.updateOne(filter, update, { upsert: true });
+      try {
+        return await collection.updateOne(filter, update, { upsert: true });
+      } catch (e2) {
+        if (e2?.code === 11000) {
+          // Structural conflict, not a transient race (e.g. a unique index
+          // on a secondary field — such as deviceKey — that isn't scoped
+          // with a partial filter, so multiple documents missing that field
+          // collide as duplicate nulls). Retrying the identical operation
+          // fails identically. Drop the offending field from this write and
+          // retry once more, so a stale/misconfigured index on one field
+          // never blocks writes to the document identified by `filter`.
+          const keyPattern = e2?.keyPattern || e2?.errorResponse?.keyPattern;
+          const offendingField = keyPattern ? Object.keys(keyPattern)[0] : null;
+          if (offendingField && update?.$set && offendingField in update.$set) {
+            const sanitized = { ...update, $set: { ...update.$set } };
+            delete sanitized.$set[offendingField];
+            return collection.updateOne(filter, sanitized, { upsert: true });
+          }
+        }
+        throw e2;
+      }
     }
     throw e;
   }
