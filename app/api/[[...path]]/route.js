@@ -189,8 +189,8 @@ const DEFAULT_CONTENT = {
   about: {
     intro: {
       fullName: 'Chintu Kumar',
-      location: 'Bihar (currently living in Haryana, India)',
-      age: 17,
+      location: 'Uttar Pardesh (currently living in Haryana, India)',
+      age: *7,
       experience: 'Over 1 year of trading',
       markets: 'Focused on stable markets like EUR/USD (CFD). Occasionally Gold when opportunity presents.',
       milestones: 'Took loans from friends and family, rebuilt from deep losses, paid every loan back. Today debt-free.',
