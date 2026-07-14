@@ -287,9 +287,8 @@ function AboutPage({ content }) {
       <div className="container mx-auto px-4 max-w-4xl">
         <div className="text-center mb-10">
           <Badge className="bg-sky-500/15 text-sky-300 border-sky-400/20 rounded-full px-3 py-1">About Me</Badge>
-          // NEW
-<h2 className="mt-4 text-3xl sm:text-4xl font-extrabold text-white">{intro.fullName || 'Chintu Kumar'}</h2>
-<p className="mt-3 text-white/60 max-w-2xl mx-auto">{intro.location}</p>
+          <h2 className="mt-4 text-3xl sm:text-4xl font-extrabold text-white">{intro.fullName || 'Chintu Kumar'}</h2>
+          <p className="mt-3 text-white/60 max-w-2xl mx-auto">{intro.location}</p>
         </div>
 
         {/* Intro card */}
