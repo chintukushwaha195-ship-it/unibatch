@@ -503,7 +503,7 @@ async function handle(request, { params }) {
       const txHash   = normalizeTxHash(body.txHash);
 
       if (!name && !nickname) return json({ error: 'Name or nickname required' }, 400);
-      if (!txHash)             return json({ error: 'Transaction hash is required' }, 400);
+      if (!txHash)             return json({ error: 'Please submit a valid transaction hash' }, 400);
       if (!/^0x[0-9a-f]{64}$/.test(txHash)) return json({ error: 'That does not look like a valid transaction hash' }, 400);
 
       const col = database.collection('contributors');
