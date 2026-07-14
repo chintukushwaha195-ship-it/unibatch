@@ -22,7 +22,13 @@ import { toast } from 'sonner';
 const WALLET_FALLBACK = '0x815c9aeE32b098f7256A51957E1A4eE7290DF314';
 const trustLink = (addr) => `https://link.trustwallet.com/send?asset=c20000714_t0x55d398326f99059ff775485246999027b3197955&address=${addr}`;
 const bscscanLink = (addr) => `https://bscscan.com/address/${addr}`;
-const qrUrl = (addr) => `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(addr)}&bgcolor=0a1435&color=ffffff&margin=8&qzone=1`;
+// EIP-681 payment URI — encodes chain (BSC = 56) + token contract (USDT BEP20)
+// + recipient, so compatible wallet apps (Trust Wallet, MetaMask mobile, etc.)
+// can auto-select the right network/token instead of relying on the user.
+const qrUrl = (addr) => {
+  const uri = `ethereum:0x55d398326f99059fF775485246999027B3197955@56/transfer?address=${addr}`;
+  return `https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=${encodeURIComponent(uri)}&bgcolor=0a1435&color=ffffff&margin=8&qzone=1`;
+};
 
 const PAGES = [
   { key: 'hero', label: 'Home' },
