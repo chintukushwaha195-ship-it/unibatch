@@ -42,6 +42,7 @@
  */
 
 import { NextResponse } from 'next/server';
+import crypto from 'crypto';
 import { v4 as uuidv4 } from 'uuid';
 
 import { getDb }               from '@/lib/db';
@@ -66,6 +67,12 @@ import { json, applyCors, maskEmail, sessionLabelFromUtc, pad6 } from '@/lib/api
 
 // ---------- Constants ----------
 const DEFAULT_GOAL = 250;
+
+// ---------- OTP hashing helper ----------
+// OTP ko plaintext ki jagah SHA-256 hash ke roop mein store karo
+function hashOtp(otp) {
+  return crypto.createHash('sha256').update(String(otp)).digest('hex');
+}
 
 // EVM/BEP20 address format: 0x + 40 hex chars.
 const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
@@ -778,10 +785,10 @@ async function handle(request, { params }) {
       const otpExpiresAt = new Date(now.getTime() + 60 * 1000).toISOString(); // 1 minute
 
       await safeUpsert(
-        security,
-        { ipKey },
-        { $set: { ipKey, deviceKey, otpCode: otp, otpExpiresAt, otpAttempts: 0, otpBlockedUntil: null, updatedAt: now.toISOString() } }
-      );
+  security,
+  { ipKey },
+  { $set: { ipKey, deviceKey, otpCode: hashOtp(otp), otpExpiresAt, otpAttempts: 0, otpBlockedUntil: null, updatedAt: now.toISOString() } }
+);
 
       // Send OTP email
       try {
@@ -861,8 +868,7 @@ async function handle(request, { params }) {
       // ever touching crypto.timingSafeEqual, and fails closed (false)
       // on any malformed input without leaking timing information.
       const storedOtp = typeof sec.otpCode === 'string' ? sec.otpCode : '';
-      const otpOk     = verifyOtp(otpInput, storedOtp);
-
+      const otpOk     = verifyOtp(hashOtp(otpInput), storedOtp);
       if (!otpOk) {
         const newAttempts  = (Number(sec.otpAttempts) || 0) + 1;
         let otpBlockedUntil = sec.otpBlockedUntil || null;
