@@ -59,6 +59,8 @@ import {
   checkAdminCredentials,
   generateOtp,
   verifyOtp,
+  hashOtp,
+  compareOtp,
 }                              from '@/lib/auth';
 import { sendOtpEmail, sendRecoveryEmail, maskedRecoveryEmail, isSmtpConfigured } from '@/lib/email';
 import { verifyTxOnChain, normalizeTxHash, DEFAULT_WALLET } from '@/lib/blockchain';
@@ -654,9 +656,6 @@ async function handle(request, { params }) {
      * Returns 401 for wrong credentials — NEVER 500.
      */
     if (route === '/admin/login' && method === 'POST') {
-      console.log("===== LOGIN API HIT =====");
-console.log("Route:", route);
-console.log("Method:", method);
       let body;
       try { body = await request.json(); } catch { return json({ error: 'Invalid JSON body' }, 400); }
 
@@ -764,12 +763,13 @@ console.log("Method:", method);
 
       // Generate and store OTP
       const otp          = generateOtp();
+      const otpHash       = await hashOtp(otp); // never store the OTP itself
       const otpExpiresAt = new Date(now.getTime() + 60 * 1000).toISOString(); // 1 minute
 
       await safeUpsert(
         security,
         { ipKey },
-        { $set: { ipKey, deviceKey, otpCode: otp, otpExpiresAt, otpAttempts: 0, otpBlockedUntil: null, updatedAt: now.toISOString() } }
+        { $set: { ipKey, deviceKey, otpCode: otpHash, otpExpiresAt, otpAttempts: 0, otpBlockedUntil: null, updatedAt: now.toISOString() } }
       );
 
       // Send OTP email
@@ -787,7 +787,7 @@ console.log("Method:", method);
       // Record successful send time for the cooldown check above.
       await security.updateOne({ ipKey }, { $set: { otpLastSentAt: now.toISOString() } });
 
-      return json({ ok: true, step: 'otp', sentTo: maskedRecoveryEmail() });
+      return json({ ok: true, step: 'otp' });
     }
 
     /**
@@ -849,8 +849,8 @@ console.log("Method:", method);
       // verifyOtp() validates both values are exactly 6 digits before
       // ever touching crypto.timingSafeEqual, and fails closed (false)
       // on any malformed input without leaking timing information.
-      const storedOtp = typeof sec.otpCode === 'string' ? sec.otpCode : '';
-      const otpOk     = verifyOtp(otpInput, storedOtp);
+      const storedOtpHash = typeof sec.otpCode === 'string' ? sec.otpCode : '';
+      const otpOk         = await compareOtp(otpInput, storedOtpHash);
 
       if (!otpOk) {
         const newAttempts  = (Number(sec.otpAttempts) || 0) + 1;
@@ -978,7 +978,7 @@ console.log("Method:", method);
         }
       );
 
-      return json({ ok: true, sentTo: maskedRecoveryEmail() });
+      return json({ ok: true });
     }
 
     // ========================================================

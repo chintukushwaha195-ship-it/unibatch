@@ -160,7 +160,7 @@ export default function AdminLoginPage() {
     try {
       const res = await fetch('/api/admin/recovery', { method: 'POST' });
       const data = await res.json();
-      if (data.ok) toast.success(`Recovery instructions sent to ${data.sentTo}`);
+      if (data.ok) toast.success('Recovery instructions sent to your registered email.');
       else toast.error(data.error || 'Failed to send recovery email');
     } catch (err) {
       toast.error('Connection error');
