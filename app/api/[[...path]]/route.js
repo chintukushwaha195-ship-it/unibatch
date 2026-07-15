@@ -668,11 +668,8 @@ async function handle(request, { params }) {
      * Returns 401 for wrong credentials — NEVER 500.
      */
     if (route === '/admin/login' && method === 'POST') {
-      console.log("===== LOGIN API HIT =====");
-console.log("Route:", route);
-console.log("Method:", method);
-      let body;
-      try { body = await request.json(); } catch { return json({ error: 'Invalid JSON body' }, 400); }
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'Invalid JSON body' }, 400); }
 
       // Coerce inputs to strings before any string operation
       const username    = typeof body.username    === 'string' ? body.username    : '';
