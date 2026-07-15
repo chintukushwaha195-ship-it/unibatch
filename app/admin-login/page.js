@@ -156,7 +156,7 @@ export default function AdminLoginPage() {
   };
 
   // ---------- Password recovery ----------
-  const recover = async () => {
+ const recover = async () => {
   try {
     const res = await fetch('/api/admin/recovery', { method: 'POST' });
     const data = await res.json();
