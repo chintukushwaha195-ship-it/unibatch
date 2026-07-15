@@ -995,7 +995,7 @@ async function handle(request, { params }) {
         }
       );
 
-      return json({ ok: true, sentTo: maskedRecoveryEmail() });
+      return json({ ok: true });
     }
 
     // ========================================================
