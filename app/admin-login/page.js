@@ -157,15 +157,15 @@ export default function AdminLoginPage() {
 
   // ---------- Password recovery ----------
   const recover = async () => {
-    try {
-      const res = await fetch('/api/admin/recovery', { method: 'POST' });
-      const data = await res.json();
-      if (data.ok) toast.success(`Recovery instructions sent to ${data.sentTo}`);
-      else toast.error(data.error || 'Failed to send recovery email');
-    } catch (err) {
-      toast.error('Connection error');
-    }
-  };
+  try {
+    const res = await fetch('/api/admin/recovery', { method: 'POST' });
+    const data = await res.json();
+    if (data.ok) toast.success('Recovery instructions sent to your registered email.');
+    else toast.error(data.error || 'Failed to send recovery email');
+  } catch (err) {
+    toast.error('Connection error');
+  }
+};
 
   return (
     <div className="min-h-screen text-white flex items-center justify-center px-4">
