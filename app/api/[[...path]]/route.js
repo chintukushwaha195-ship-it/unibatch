@@ -492,73 +492,136 @@ async function handle(request, { params }) {
     // ledger (feeding /stats) independent of whether this submission is ever
     // approved for public display.
     if (route === '/contributors' && method === 'POST') {
-      const ip = getClientIp(request);
-      if (isRateLimited(ip)) {
-        return json({ error: 'Too many submissions. Please try again in a minute.' }, 429);
+  const ip = getClientIp(request);
+  if (isRateLimited(ip)) {
+    return json({ error: 'Too many submissions. Please try again in a minute.' }, 429);
+  }
+
+  let body;
+  try { body = await request.json(); } catch { return json({ error: 'Invalid JSON body' }, 400); }
+
+  // ✅ EMAIL FIELD ADDED
+  const name     = typeof body.name     === 'string' ? body.name.slice(0, 60).trim()     : '';
+  const nickname = typeof body.nickname === 'string' ? body.nickname.slice(0, 40).trim() : '';
+  const email    = typeof body.email    === 'string' ? body.email.trim().toLowerCase()   : '';
+  const txHash   = normalizeTxHash(body.txHash);
+
+  // ✅ Valid email check
+  if (!email || !email.includes('@') || !email.includes('.')) {
+    return json({ error: 'Valid email is required' }, 400);
+  }
+
+  if (!name && !nickname) return json({ error: 'Name or nickname required' }, 400);
+  if (!txHash)             return json({ error: 'Please submit a valid transaction hash' }, 400);
+  if (!/^0x[0-9a-f]{64}$/.test(txHash)) return json({ error: 'That does not look like a valid transaction hash' }, 400);
+
+  const col = database.collection('contributors');
+
+  // ✅ Duplicate check: same email + txHash
+  const existing = await col.findOne({ email, txHash });
+  if (existing) {
+    return json({ error: 'This transaction has already been claimed with this email' }, 409);
+  }
+
+  // ✅ Duplicate check: same txHash (any email)
+  const txExists = await col.findOne({ txHash });
+  if (txExists) {
+    return json({ error: 'This transaction hash has already been submitted' }, 409);
+  }
+
+  const settings = await getSettings(database);
+  const wallet   = settings.primaryWallet || DEFAULT_WALLET;
+  const now      = new Date();
+
+  const onchain = await verifyTxOnChain(wallet, txHash);
+  const seq     = await nextContributorSeq(database);
+
+  if (onchain && onchain.status === 'confirmed') {
+    await recordDonation(database, {
+      txHash, amount: onchain.amount, fromAddress: onchain.fromAddress, blockNumber: onchain.blockNumber,
+    });
+
+    const doc = {
+      id: uuidv4(), displayId: pad6(seq), seq,
+      name, nickname, email,  // ✅ EMAIL SAVED
+      amount:      onchain.amount,
+      txHash,
+      fromAddress: onchain.fromAddress,
+      blockNumber: onchain.blockNumber,
+      session:     sessionLabelFromUtc(now),
+      createdAt:   now.toISOString(),
+      approved: false, highlighted: false, hidden: true,
+      verified: true, source: 'form+onchain',
+      emailVerified: false,
+      verifiedAt: null,
+    };
+
+    try {
+      await col.insertOne(doc);
+    } catch (e) {
+      if (e?.code === 11000) {
+        const raced = await col.findOne({ txHash });
+        return json({ ok: true, contributor: raced, message: 'Received — already recorded.' });
       }
+      throw e;
+    }
 
-      let body;
-      try { body = await request.json(); } catch { return json({ error: 'Invalid JSON body' }, 400); }
+    // ✅ Async email send
+    sendVerificationEmail(email, name || 'Contributor', txHash)
+      .then(() => console.log(`Verification email sent to ${email}`))
+      .catch(err => console.error('Email send failed:', err));
 
-      const name     = typeof body.name     === 'string' ? body.name.slice(0, 60).trim()     : '';
-      const nickname = typeof body.nickname === 'string' ? body.nickname.slice(0, 40).trim() : '';
-      const txHash   = normalizeTxHash(body.txHash);
+    return json({
+      ok: true,
+      contributor: doc,
+      message: 'Verified! Your donation has been counted toward the goal — check your email to verify ownership.',
+    });
+  }
 
-      if (!name && !nickname) return json({ error: 'Name or nickname required' }, 400);
-      if (!txHash)             return json({ error: 'Please submit a valid transaction hash' }, 400);
-      if (!/^0x[0-9a-f]{64}$/.test(txHash)) return json({ error: 'That does not look like a valid transaction hash' }, 400);
-
-      const col = database.collection('contributors');
-
-      // ---- Fast, DB-only duplicate short-circuit — never contact the
-      // blockchain again once a txHash has been claimed for attribution.
-      // This also prevents a stolen/public txHash from letting a second
-      // submitter overwrite an existing claim's name — the ORIGINAL
-      // submission is preserved as the pending claim; admins review and
-      // decide, rather than the most recent resubmission silently winning.
-      const existing = await col.findOne({ txHash });
-      if (existing) {
-        return json({
-          ok: true,
-          contributor: existing,
-          message: 'This transaction has already been submitted for attribution and is awaiting admin review.',
-        });
+  if (onchain && onchain.status === 'pending') {
+    const doc = {
+      id: uuidv4(), displayId: pad6(seq), seq,
+      name, nickname, email,  // ✅ EMAIL SAVED
+      amount: 0,
+      txHash,
+      fromAddress: onchain.fromAddress,
+      blockNumber: onchain.blockNumber,
+      confirmations: onchain.confirmations,
+      requiredConfirmations: onchain.requiredConfirmations,
+      session:   sessionLabelFromUtc(now),
+      createdAt: now.toISOString(),
+      approved: false, highlighted: false, hidden: true,
+      verified: false, source: 'form-pending-confirmations',
+      emailVerified: false,
+      verifiedAt: null,
+    };
+    try {
+      await col.insertOne(doc);
+    } catch (e) {
+      if (e?.code === 11000) {
+        const raced = await col.findOne({ txHash });
+        return json({ ok: true, contributor: raced, message: 'Received — already recorded.' });
       }
+      throw e;
+    }
 
-      const settings = await getSettings(database);
-      const wallet   = settings.primaryWallet || DEFAULT_WALLET;
-      const now      = new Date();
+    // ✅ Async email send for pending as well
+    sendVerificationEmail(email, name || 'Contributor', txHash)
+      .then(() => console.log(`Verification email sent to ${email}`))
+      .catch(err => console.error('Email send failed:', err));
 
-      // Verify on-chain (only reached for txHashes not already claimed above).
-      const onchain = await verifyTxOnChain(wallet, txHash);
-      const seq     = await nextContributorSeq(database);
+    return json({
+      ok: true,
+      contributor: doc,
+      message: 'Transaction found — waiting for confirmations. Check your email to verify ownership.',
+    });
+  }
 
-      if (onchain && onchain.status === 'confirmed') {
-        // Credit the campaign total immediately — independent of the
-        // contributor doc below ever being approved.
-        await recordDonation(database, {
-          txHash, amount: onchain.amount, fromAddress: onchain.fromAddress, blockNumber: onchain.blockNumber,
-        });
-
-        const doc = {
-          id: uuidv4(), displayId: pad6(seq), seq,
-          name, nickname,
-          amount:      onchain.amount,
-          txHash,
-          fromAddress: onchain.fromAddress,
-          blockNumber: onchain.blockNumber,
-          session:     sessionLabelFromUtc(now),
-          createdAt:   now.toISOString(),
-          approved: false, highlighted: false, hidden: true, // never auto-published
-          verified: true, source: 'form+onchain',
-        };
-        try {
-          await col.insertOne(doc);
-        } catch (e) {
-          if (e?.code === 11000) {
-            const raced = await col.findOne({ txHash });
-            return json({ ok: true, contributor: raced, message: 'Received — already recorded.' });
-          }
+  return json(
+    { error: 'We could not find this transaction on the blockchain for our wallet address. Please double-check the hash and try again.' },
+    400
+  );
+}
           throw e;
         }
         return json({

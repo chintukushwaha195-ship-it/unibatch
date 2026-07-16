@@ -213,6 +213,10 @@ export default function AdminDashboard() {
                           {c.highlighted && <Badge className="bg-gold-400/15 text-gold-400 border-gold-400/30">pinned</Badge>}
                           {c.hidden && <Badge className="bg-rose-500/15 text-rose-300 border-rose-400/30">hidden</Badge>}
                         </div>
+                        {/* ✅ EMAIL ADDED HERE */}
+                        <div className="text-[11px] text-white/50 mt-0.5">
+                          📧 {c.email || 'No email'}
+                        </div>
                         <div className="text-[11px] text-white/50 mt-0.5">
                           ${Number(c.amount).toFixed(2)} · {c.session} UTC · {new Date(c.createdAt).toLocaleString()}
                           {c.txHash && (
