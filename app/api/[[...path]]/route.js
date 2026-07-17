@@ -62,7 +62,7 @@ import {
   hashOtp,
   compareOtp,
 }                              from '@/lib/auth';
-import { sendOtpEmail, sendRecoveryEmail, maskedRecoveryEmail, isSmtpConfigured } from '@/lib/email';
+import { sendOtpEmail, sendRecoveryEmail, maskedRecoveryEmail, isSmtpConfigured, sendVerificationEmail } from '@/lib/email';
 import { verifyTxOnChain, normalizeTxHash, DEFAULT_WALLET } from '@/lib/blockchain';
 import { json, applyCors, maskEmail, sessionLabelFromUtc, pad6 } from '@/lib/api-utils';
 
@@ -566,7 +566,53 @@ async function handle(request, { params }) {
       throw e;
     }
 
-     
+   
+
+    // ✅ Async email send — verification link sent after successful on-chain match
+    sendVerificationEmail(email, name || 'Contributor', txHash)
+      .then(() => console.log(`Verification email sent to ${email}`))
+      .catch(err => console.error('Email send failed:', err));
+
+    return json({
+      ok: true,
+      contributor: doc,
+      message: 'Transaction found — waiting for confirmations. Check your email to verify ownership.',
+    });
+  }
+
+  if (onchain && onchain.status === 'pending') {
+        // Found on-chain but not yet past the confirmation-depth threshold —
+        // do NOT credit the total yet (avoids counting transactions that
+        // could still be reorged out).
+        const doc = {
+          id: uuidv4(), displayId: pad6(seq), seq,
+          name, nickname,
+          amount: 0,
+          txHash,
+          fromAddress: onchain.fromAddress,
+          blockNumber: onchain.blockNumber,
+          confirmations: onchain.confirmations,
+          requiredConfirmations: onchain.requiredConfirmations,
+          session:   sessionLabelFromUtc(now),
+          createdAt: now.toISOString(),
+          approved: false, highlighted: false, hidden: true,
+          verified: false, source: 'form-pending-confirmations',
+        };
+        try {
+          await col.insertOne(doc);
+        } catch (e) {
+          if (e?.code === 11000) {
+            const raced = await col.findOne({ txHash });
+            return json({ ok: true, contributor: raced, message: 'Received — already recorded.' });
+          }
+          throw e;
+        }
+        return json({
+          ok: true,
+          contributor: doc,
+          message: 'Transaction found on-chain — waiting for more block confirmations before it counts toward the goal.',
+        });
+      }
 
       // Not found on-chain at all — either a fake/malformed hash or a
       // transaction sent to a different wallet. Reject at submission
