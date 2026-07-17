@@ -49,7 +49,7 @@ export default function AdminDashboard() {
       const [s, c, ct, w] = await Promise.all([
         authFetch('/api/admin/stats').then((r) => r.json()),
         authFetch('/api/admin/contributors').then((r) => r.json()),
-        fetch('/api/content').then((r) => r.json()),
+        fetch('/api/content', { cache: 'no-store' }).then((r) => r.json()),
         authFetch('/api/admin/wallets').then((r) => r.json()),
       ]);
       setStats(s);
@@ -340,30 +340,71 @@ function StatBox({ icon: Icon, label, value, accent }) {
 
 function AboutEditor({ content, onSave, saving }) {
   const [local, setLocal] = useState(null);
-  useEffect(() => { if (content?.about) setLocal(JSON.parse(JSON.stringify(content.about))); }, [content]);
+  useEffect(() => {
+    if (!content?.about) return;
+    const src = content.about;
+    // Defensive defaults — if `about` was ever saved by the old mismatched
+    // editor, `intro` may be missing entirely. Never let the form crash on
+    // that; just start those fields blank instead of losing the chapters.
+    setLocal({
+      intro: {
+        fullName:   src.intro?.fullName   || '',
+        location:   src.intro?.location   || '',
+        experience: src.intro?.experience || '',
+        markets:    src.intro?.markets    || '',
+        milestones: src.intro?.milestones || '',
+        motivation: src.intro?.motivation || '',
+      },
+      chapters: Array.isArray(src.chapters)
+        ? src.chapters.map((c, i) => ({ letter: c.letter || String.fromCharCode(97 + i), title: c.title || '', body: c.body || '' }))
+        : [],
+    });
+  }, [content]);
   if (!local) return null;
+
+  const setIntro = (key, val) => setLocal({ ...local, intro: { ...local.intro, [key]: val } });
+  const setChapter = (i, key, val) => {
+    const c = [...local.chapters];
+    c[i] = { ...c[i], [key]: val };
+    setLocal({ ...local, chapters: c });
+  };
+  const addChapter = () => setLocal({ ...local, chapters: [...local.chapters, { letter: String.fromCharCode(97 + local.chapters.length), title: '', body: '' }] });
+  const removeChapter = (i) => setLocal({ ...local, chapters: local.chapters.filter((_, idx) => idx !== i) });
+
   return (
     <Card className="glass border-white/10 rounded-2xl">
       <CardContent className="p-5 space-y-3">
         <div className="text-sm font-semibold text-white">About Me</div>
-        <div>
-          <Label className="text-xs text-white/60">Tagline</Label>
-          <Input value={local.tagline} onChange={(e) => setLocal({ ...local, tagline: e.target.value })} className="mt-1 bg-white/5 border-white/10 rounded-xl" />
+
+        <div className="text-xs uppercase tracking-widest text-white/40 pt-1">Intro card (shown at the top of the About page)</div>
+        <div className="grid sm:grid-cols-2 gap-2">
+          <div><Label className="text-xs text-white/60">Full name</Label>
+            <Input value={local.intro.fullName} onChange={(e) => setIntro('fullName', e.target.value)} className="mt-1 bg-white/5 border-white/10 rounded-xl" /></div>
+          <div><Label className="text-xs text-white/60">Location</Label>
+            <Input value={local.intro.location} onChange={(e) => setIntro('location', e.target.value)} className="mt-1 bg-white/5 border-white/10 rounded-xl" /></div>
+          <div><Label className="text-xs text-white/60">Experience</Label>
+            <Input value={local.intro.experience} onChange={(e) => setIntro('experience', e.target.value)} className="mt-1 bg-white/5 border-white/10 rounded-xl" /></div>
+          <div><Label className="text-xs text-white/60">Markets I trade</Label>
+            <Input value={local.intro.markets} onChange={(e) => setIntro('markets', e.target.value)} className="mt-1 bg-white/5 border-white/10 rounded-xl" /></div>
         </div>
+        <div><Label className="text-xs text-white/60">Milestone</Label>
+          <Textarea value={local.intro.milestones} onChange={(e) => setIntro('milestones', e.target.value)} className="mt-1 bg-white/5 border-white/10 rounded-xl" rows={3} /></div>
+        <div><Label className="text-xs text-white/60">Personal motivation</Label>
+          <Textarea value={local.intro.motivation} onChange={(e) => setIntro('motivation', e.target.value)} className="mt-1 bg-white/5 border-white/10 rounded-xl" rows={3} /></div>
+
+        <div className="text-xs uppercase tracking-widest text-white/40 pt-3">Trading journey chapters</div>
         {local.chapters.map((ch, i) => (
           <div key={i} className="rounded-lg bg-white/5 border border-white/10 p-3 space-y-2">
-            <Input value={ch.title} onChange={(e) => { const c = [...local.chapters]; c[i] = { ...c[i], title: e.target.value }; setLocal({ ...local, chapters: c }); }} className="bg-white/5 border-white/10 rounded-xl font-semibold" />
-            <Textarea value={ch.body} onChange={(e) => { const c = [...local.chapters]; c[i] = { ...c[i], body: e.target.value }; setLocal({ ...local, chapters: c }); }} className="bg-white/5 border-white/10 rounded-xl" rows={4} />
+            <div className="flex items-center gap-2">
+              <div className="w-8 h-8 shrink-0 rounded-lg bg-white/10 flex items-center justify-center text-xs font-bold uppercase text-sky-200">{ch.letter}</div>
+              <Input value={ch.title} onChange={(e) => setChapter(i, 'title', e.target.value)} placeholder="Chapter title" className="bg-white/5 border-white/10 rounded-xl font-semibold flex-1" />
+              <Button size="sm" variant="outline" onClick={() => removeChapter(i)} className="rounded-lg border-rose-400/30 bg-rose-500/10 hover:bg-rose-500/20 text-rose-200 shrink-0"><Trash2 className="w-3.5 h-3.5" /></Button>
+            </div>
+            <Textarea value={ch.body} onChange={(e) => setChapter(i, 'body', e.target.value)} className="bg-white/5 border-white/10 rounded-xl" rows={5} />
           </div>
         ))}
-        <div>
-          <Label className="text-xs text-white/60">Motivation</Label>
-          <Textarea value={local.motivation} onChange={(e) => setLocal({ ...local, motivation: e.target.value })} className="mt-1 bg-white/5 border-white/10 rounded-xl" rows={3} />
-        </div>
-        <div>
-          <Label className="text-xs text-white/60">Vision</Label>
-          <Textarea value={local.vision} onChange={(e) => setLocal({ ...local, vision: e.target.value })} className="mt-1 bg-white/5 border-white/10 rounded-xl" rows={3} />
-        </div>
+        <Button onClick={addChapter} variant="outline" className="rounded-xl border-white/15 bg-white/5 hover:bg-white/10 text-white"><Plus className="w-4 h-4 mr-1" /> Add chapter</Button>
+
         <Button onClick={() => onSave(local)} disabled={saving} className="rounded-xl bg-sky-500 text-navy-950 hover:bg-sky-400"><Save className="w-4 h-4 mr-1" /> Save About</Button>
       </CardContent>
     </Card>
