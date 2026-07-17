@@ -6,7 +6,7 @@ import Link from 'next/link';
 import {
   LogOut, Check, EyeOff, Star, StarOff, ArrowLeft,
   Wallet, Target, Users, TrendingUp, ExternalLink, Loader2,
-  Save, Trash2, Plus, Eye
+  Save, Trash2, Plus, Eye, Mail, Send
 } from 'lucide-react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -16,6 +16,10 @@ import { Badge } from '@/components/ui/badge';
 import { Textarea } from '@/components/ui/textarea';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Progress } from '@/components/ui/progress';
+import {
+  Dialog, DialogContent, DialogHeader, DialogTitle,
+  DialogDescription, DialogFooter, DialogTrigger,
+} from '@/components/ui/dialog';
 import { toast } from 'sonner';
 
 /**
@@ -84,6 +88,13 @@ export default function AdminDashboard() {
       else toast.success('Updated');
       loadAll();
     } catch (e) { toast.error(e.message); }
+  };
+
+  const mailContrib = async (id, { subject, message }) => {
+    const res = await authFetch(`/api/admin/contributors/${id}/mail`, { method: 'POST', body: JSON.stringify({ subject, message }) });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Failed to send');
+    toast.success(data.message || 'Email sent');
   };
 
   const saveGoal = async () => {
@@ -228,6 +239,7 @@ export default function AdminDashboard() {
                         )}
                       </div>
                       <div className="flex gap-1">
+                        <MailComposeButton contributor={c} onSend={mailContrib} />
                         <Button size="sm" variant="outline" onClick={() => patchContrib(c.id, { approved: !c.approved })}
                           className="rounded-lg border-white/15 bg-white/5 hover:bg-white/10">
                           {c.approved ? <><EyeOff className="w-3.5 h-3.5 mr-1" /> Unapprove</> : <><Check className="w-3.5 h-3.5 mr-1" /> Approve</>}
@@ -434,6 +446,62 @@ function FaqEditor({ content, onSave, saving }) {
         <Button onClick={() => onSave(local)} disabled={saving} className="rounded-xl bg-sky-500 text-navy-950 hover:bg-sky-400"><Save className="w-4 h-4 mr-1" /> Save FAQ</Button>
       </CardContent>
     </Card>
+  );
+}
+
+function MailComposeButton({ contributor, onSend }) {
+  const [open, setOpen] = useState(false);
+  const [subject, setSubject] = useState('');
+  const [message, setMessage] = useState('');
+  const [sending, setSending] = useState(false);
+  const hasEmail = Boolean(contributor.email);
+
+  const send = async () => {
+    if (!message.trim()) return toast.error('Write a message first');
+    setSending(true);
+    try {
+      await onSend(contributor.id, { subject: subject.trim(), message: message.trim() });
+      setOpen(false);
+      setSubject(''); setMessage('');
+    } catch (e) { toast.error(e.message); }
+    finally { setSending(false); }
+  };
+
+  return (
+    <Dialog open={open} onOpenChange={setOpen}>
+      <DialogTrigger asChild>
+        <Button
+          size="sm" variant="outline" disabled={!hasEmail}
+          title={hasEmail ? `Email ${contributor.email}` : 'No email on file'}
+          className="rounded-lg border-sky-400/30 bg-sky-500/10 hover:bg-sky-500/20 text-sky-200 disabled:opacity-30"
+        >
+          <Mail className="w-3.5 h-3.5" />
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="bg-navy-950 border-white/10 text-white rounded-2xl">
+        <DialogHeader>
+          <DialogTitle>Email {contributor.name || contributor.nickname || `#${contributor.displayId}`}</DialogTitle>
+          <DialogDescription className="text-white/50">
+            Sends from the official UNIBATCH address to <span className="text-sky-300">{contributor.email}</span>.
+          </DialogDescription>
+        </DialogHeader>
+        <div className="space-y-3">
+          <div>
+            <Label className="text-xs text-white/60">Subject</Label>
+            <Input value={subject} onChange={(e) => setSubject(e.target.value)} placeholder="e.g. About your contribution" className="mt-1 bg-white/5 border-white/10 rounded-xl" />
+          </div>
+          <div>
+            <Label className="text-xs text-white/60">Message</Label>
+            <Textarea value={message} onChange={(e) => setMessage(e.target.value)} rows={6} placeholder="Write your message…" className="mt-1 bg-white/5 border-white/10 rounded-xl" />
+          </div>
+        </div>
+        <DialogFooter>
+          <Button onClick={send} disabled={sending} className="rounded-xl bg-gradient-to-r from-sky-500 to-cyan-400 text-navy-950 font-semibold">
+            {sending ? <Loader2 className="w-4 h-4 animate-spin" /> : <><Send className="w-4 h-4 mr-1" /> Send email</>}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   );
 }
 

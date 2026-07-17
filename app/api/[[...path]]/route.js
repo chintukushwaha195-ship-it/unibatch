@@ -20,6 +20,8 @@
  *    GET  /stats
  *    GET  /contributors
  *    POST /contributors
+ *    POST /contributors/verify-email   OTP → confirms email ownership of a contribution
+ *    POST /contributors/resend-otp     resends the ownership OTP (rate limited)
  *    GET  /content
  *
  *  ADMIN AUTH (no session required — these establish the session)
@@ -33,6 +35,7 @@
  *    GET  /admin/stats
  *    GET  /admin/contributors
  *    PATCH /admin/contributors/:id
+ *    POST /admin/contributors/:id/mail   custom email to one contributor
  *    PATCH /admin/content
  *    PATCH /admin/goal
  *    GET  /admin/wallets
@@ -62,7 +65,16 @@ import {
   hashOtp,
   compareOtp,
 }                              from '@/lib/auth';
-import { sendOtpEmail, sendRecoveryEmail, maskedRecoveryEmail, isSmtpConfigured, sendVerificationEmail } from '@/lib/email';
+import {
+  sendOtpEmail,
+  sendRecoveryEmail,
+  maskedRecoveryEmail,
+  isSmtpConfigured,
+  sendContributionOtpEmail,
+  sendContributionVerifiedEmail,
+  sendThankYouEmail,
+  sendCustomEmail,
+} from '@/lib/email';
 import { verifyTxOnChain, normalizeTxHash, DEFAULT_WALLET } from '@/lib/blockchain';
 import { json, applyCors, maskEmail, sessionLabelFromUtc, pad6 } from '@/lib/api-utils';
 
@@ -74,6 +86,13 @@ const EVM_ADDRESS_RE = /^0x[0-9a-fA-F]{40}$/;
 
 // OTP resend cooldown — independent of any client-supplied value.
 const OTP_RESEND_COOLDOWN_MS = 60 * 1000;
+
+// Contribution ownership OTP — separate lifetime from the admin-login OTP
+// above (that one is 1 minute; a contributor filling in a code from their
+// inbox reasonably needs longer).
+const CONTRIB_OTP_TTL_MS           = 10 * 60 * 1000; // 10 minutes
+const CONTRIB_OTP_RESEND_COOLDOWN_MS = 45 * 1000;     // 45s between resends
+const CONTRIB_OTP_MAX_ATTEMPTS     = 5;
 
 // Password-recovery email rate limiting — independent of any client-supplied
 // value, keyed only on the server-observed IP (ipKey), matching the pattern
@@ -541,6 +560,12 @@ async function handle(request, { params }) {
       txHash, amount: onchain.amount, fromAddress: onchain.fromAddress, blockNumber: onchain.blockNumber,
     });
 
+    // Ownership OTP — generated up front so it can be persisted in the same
+    // insert as the contributor doc (avoids a second write + race window).
+    const otp        = generateOtp();
+    const otpHash     = await hashOtp(otp);
+    const otpExpiresAt = new Date(now.getTime() + CONTRIB_OTP_TTL_MS).toISOString();
+
     const doc = {
       id: uuidv4(), displayId: pad6(seq), seq,
       name, nickname, email,  // ✅ EMAIL SAVED
@@ -554,6 +579,8 @@ async function handle(request, { params }) {
       verified: true, source: 'form+onchain',
       emailVerified: false,
       verifiedAt: null,
+      otpCode: otpHash, otpExpiresAt, otpAttempts: 0, otpLastSentAt: now.toISOString(),
+      thankYouSent: false,
     };
 
     try {
@@ -566,17 +593,18 @@ async function handle(request, { params }) {
       throw e;
     }
 
-   
+    // ✅ Async email send — 6-digit ownership OTP sent after successful on-chain match
+    sendContributionOtpEmail(email, name || 'Contributor', otp, doc.displayId)
+      .then(() => console.log(`Ownership OTP sent to ${email}`))
+      .catch(err => console.error('OTP email send failed:', err));
 
-    // ✅ Async email send — verification link sent after successful on-chain match
-    sendVerificationEmail(email, name || 'Contributor', txHash)
-      .then(() => console.log(`Verification email sent to ${email}`))
-      .catch(err => console.error('Email send failed:', err));
+    const { otpCode, ...safeDoc } = doc;
 
     return json({
       ok: true,
-      contributor: doc,
-      message: 'Transaction found — waiting for confirmations. Check your email to verify ownership.',
+      contributor: safeDoc,
+      requiresOtp: true,
+      message: 'Transaction found — check your email for a 6-digit code to confirm ownership.',
     });
   }
 
@@ -621,6 +649,114 @@ async function handle(request, { params }) {
         { error: 'We could not find this transaction on the blockchain for our wallet address. Please double-check the hash and try again.' },
         400
       );
+    }
+
+    // POST /contributors/verify-email
+    // Confirms the 6-digit OTP proves ownership of the email address tied
+    // to a contribution. On success: marks emailVerified, then fires the
+    // "verified" email followed by a separate thank-you email.
+    if (route === '/contributors/verify-email' && method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'Invalid JSON body' }, 400); }
+
+      const email  = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+      const txHash = normalizeTxHash(body.txHash);
+      const otp    = typeof body.otp   === 'string' ? body.otp.trim()  : '';
+
+      if (!email || !txHash) return json({ error: 'Email and transaction hash are required' }, 400);
+      if (!otp)               return json({ error: 'Enter the 6-digit code from your email' }, 400);
+
+      const col = database.collection('contributors');
+      const contributor = await col.findOne({ email, txHash });
+      if (!contributor) return json({ error: 'No matching contribution found for this email' }, 404);
+
+      if (contributor.emailVerified) {
+        return json({ ok: true, alreadyVerified: true, contributor, message: 'This contribution is already verified.' });
+      }
+
+      if (!contributor.otpCode) {
+        return json({ error: 'No pending code for this contribution. Request a new one.' }, 400);
+      }
+
+      if (!contributor.otpExpiresAt || new Date(contributor.otpExpiresAt) <= new Date()) {
+        return json({ error: 'That code has expired. Request a new one.' }, 400);
+      }
+
+      const attempts = Number(contributor.otpAttempts) || 0;
+      if (attempts >= CONTRIB_OTP_MAX_ATTEMPTS) {
+        return json({ error: 'Too many incorrect attempts. Request a new code.' }, 429);
+      }
+
+      const otpOk = await compareOtp(otp, contributor.otpCode);
+      if (!otpOk) {
+        await col.updateOne({ id: contributor.id }, { $inc: { otpAttempts: 1 } });
+        return json({ error: 'Incorrect code. Please try again.' }, 401);
+      }
+
+      const verifiedAt = new Date();
+      await col.updateOne(
+        { id: contributor.id },
+        {
+          $set: { emailVerified: true, verifiedAt: verifiedAt.toISOString(), thankYouSent: true },
+          $unset: { otpCode: '', otpExpiresAt: '', otpAttempts: '' },
+        }
+      );
+      const updated = await col.findOne({ id: contributor.id });
+
+      // Two separate emails, as requested: a "you're verified" notice,
+      // followed by a distinct thank-you note.
+      sendContributionVerifiedEmail(email, contributor.name || contributor.nickname, contributor.displayId, txHash)
+        .then(() => sendThankYouEmail(email, contributor.name || contributor.nickname, contributor.displayId, contributor.amount))
+        .catch(err => console.error('Post-verification email failed:', err));
+
+      const { otpCode, ...safeDoc } = updated;
+      return json({ ok: true, contributor: safeDoc, message: 'Verified! Thank you — check your email.' });
+    }
+
+    // POST /contributors/resend-otp
+    if (route === '/contributors/resend-otp' && method === 'POST') {
+      let body;
+      try { body = await request.json(); } catch { return json({ error: 'Invalid JSON body' }, 400); }
+
+      const email  = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+      const txHash = normalizeTxHash(body.txHash);
+      if (!email || !txHash) return json({ error: 'Email and transaction hash are required' }, 400);
+
+      const col = database.collection('contributors');
+      const contributor = await col.findOne({ email, txHash });
+      if (!contributor) return json({ error: 'No matching contribution found for this email' }, 404);
+      if (contributor.emailVerified) return json({ error: 'This contribution is already verified.' }, 400);
+
+      const now = new Date();
+      if (contributor.otpLastSentAt) {
+        const elapsedMs = now.getTime() - new Date(contributor.otpLastSentAt).getTime();
+        if (elapsedMs < CONTRIB_OTP_RESEND_COOLDOWN_MS) {
+          const waitSeconds = Math.ceil((CONTRIB_OTP_RESEND_COOLDOWN_MS - elapsedMs) / 1000);
+          return json({ error: `Please wait ${waitSeconds}s before requesting another code.` }, 429);
+        }
+      }
+
+      if (!isSmtpConfigured()) {
+        return json({ error: 'Verification email cannot be sent right now. Please try again later.' }, 503);
+      }
+
+      const otp         = generateOtp();
+      const otpHash      = await hashOtp(otp);
+      const otpExpiresAt = new Date(now.getTime() + CONTRIB_OTP_TTL_MS).toISOString();
+
+      await col.updateOne(
+        { id: contributor.id },
+        { $set: { otpCode: otpHash, otpExpiresAt, otpAttempts: 0, otpLastSentAt: now.toISOString() } }
+      );
+
+      try {
+        await sendContributionOtpEmail(email, contributor.name || contributor.nickname, otp, contributor.displayId);
+      } catch (err) {
+        console.error('Resend OTP email failed:', err);
+        return json({ error: 'Could not send the code. Please try again.' }, 500);
+      }
+
+      return json({ ok: true, message: 'A new code has been sent to your email.' });
     }
 
     // GET /content
@@ -1075,6 +1211,39 @@ async function handle(request, { params }) {
         await database.collection('contributors').updateOne({ id }, { $set: patch });
         const updated = await database.collection('contributors').findOne({ id });
         return json({ ok: true, contributor: updated, warning });
+      }
+
+      // POST /admin/contributors/:id/mail
+      // "Click to mail" — admin composes a subject + message and it's sent
+      // to that contributor's email from the official UNIBATCH address.
+      if (route.startsWith('/admin/contributors/') && route.endsWith('/mail') && method === 'POST') {
+        const id = pathSegs[pathSegs.length - 2];
+        if (!id) return json({ error: 'Contributor ID required' }, 400);
+
+        let body;
+        try { body = await request.json(); } catch { return json({ error: 'Invalid JSON body' }, 400); }
+
+        const subject = typeof body.subject === 'string' ? body.subject.trim().slice(0, 150) : '';
+        const message = typeof body.message === 'string' ? body.message.trim().slice(0, 5000) : '';
+        if (!message) return json({ error: 'Message body is required' }, 400);
+
+        const contributor = await database.collection('contributors').findOne({ id });
+        if (!contributor) return json({ error: 'Contributor not found' }, 404);
+        if (!contributor.email) return json({ error: 'This contributor has no email on file' }, 400);
+
+        if (!isSmtpConfigured()) {
+          return json({ error: 'SMTP is not configured — set SMTP_USER / SMTP_PASSWORD.' }, 503);
+        }
+
+        const result = await sendCustomEmail(
+          contributor.email,
+          subject,
+          message,
+          contributor.name || contributor.nickname
+        );
+        if (!result.ok) return json({ error: result.error || 'Failed to send email' }, 500);
+
+        return json({ ok: true, message: `Email sent to ${contributor.email}` });
       }
 
       // PATCH /admin/content

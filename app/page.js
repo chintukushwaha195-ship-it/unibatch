@@ -514,9 +514,24 @@ function StrategyPage({ content }) {
 function SupportPage({ stats, contributors, refresh, content }) {
   const [copied, setCopied] = useState(false);
   const [submitting, setSubmitting] = useState(false);
-  const [form, setForm] = useState({ name: '', txHash: '' });
+  const [form, setForm] = useState({ name: '', email: '', txHash: '' });
   const wallet = content?.primaryWallet || stats?.wallet || WALLET_FALLBACK;
   const extraWallets = content?.wallets || [];
+
+  // OTP-verification step — entered once the backend confirms the tx
+  // on-chain and emails a 6-digit ownership code to `form.email`.
+  const [otpStage, setOtpStage] = useState(false);
+  const [otp, setOtp] = useState('');
+  const [verifying, setVerifying] = useState(false);
+  const [verified, setVerified] = useState(false);
+  const [resendCooldown, setResendCooldown] = useState(0);
+  const [pending, setPending] = useState({ email: '', txHash: '', displayId: '' });
+
+  useEffect(() => {
+    if (resendCooldown <= 0) return;
+    const t = setInterval(() => setResendCooldown((s) => Math.max(0, s - 1)), 1000);
+    return () => clearInterval(t);
+  }, [resendCooldown]);
 
   const copyAddress = async () => {
     try {
@@ -529,20 +544,63 @@ function SupportPage({ stats, contributors, refresh, content }) {
   const submit = async (e) => {
     e.preventDefault();
     if (!form.name.trim()) return toast.error('Please enter a name or nickname');
+    if (!form.email.trim() || !form.email.includes('@')) return toast.error('Please enter a valid email — we use it to confirm ownership');
     if (!form.txHash.trim()) return toast.error('Please enter your transaction hash — it\'s how we verify your donation');
     setSubmitting(true);
     try {
       const res = await fetch('/api/contributors', {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: form.name, nickname: form.name, txHash: form.txHash }),
+        body: JSON.stringify({ name: form.name, nickname: form.name, email: form.email, txHash: form.txHash }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Failed');
       toast.success(data.message || `Thank you! You are contributor ${data.contributor.displayId}`);
-      setForm({ name: '', txHash: '' });
+      if (data.requiresOtp) {
+        setPending({ email: form.email.trim().toLowerCase(), txHash: form.txHash.trim(), displayId: data.contributor?.displayId });
+        setOtpStage(true);
+        setResendCooldown(45);
+      }
       refresh();
     } catch (err) { toast.error(err.message); }
     finally { setSubmitting(false); }
+  };
+
+  const submitOtp = async (e) => {
+    e.preventDefault();
+    if (!/^\d{6}$/.test(otp)) return toast.error('Enter the 6-digit code from your email');
+    setVerifying(true);
+    try {
+      const res = await fetch('/api/contributors/verify-email', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: pending.email, txHash: pending.txHash, otp }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Verification failed');
+      toast.success(data.message || 'Verified! Thank you.');
+      setVerified(true);
+      setForm({ name: '', email: '', txHash: '' });
+      refresh();
+    } catch (err) { toast.error(err.message); }
+    finally { setVerifying(false); }
+  };
+
+  const resendOtp = async () => {
+    if (resendCooldown > 0) return;
+    try {
+      const res = await fetch('/api/contributors/resend-otp', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: pending.email, txHash: pending.txHash }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to resend');
+      toast.success(data.message || 'New code sent');
+      setResendCooldown(45);
+    } catch (err) { toast.error(err.message); }
+  };
+
+  const startOver = () => {
+    setOtpStage(false); setVerified(false); setOtp('');
+    setPending({ email: '', txHash: '', displayId: '' });
   };
 
   return (
@@ -621,18 +679,55 @@ function SupportPage({ stats, contributors, refresh, content }) {
               <div className="mb-5">
                 <div className="text-xs uppercase tracking-widest text-white/50">After you send</div>
                 <div className="mt-1 font-bold text-lg text-white">Leave your mark</div>
-                <p className="text-white/60 text-sm mt-1">Add your name and TX hash — the amount is read straight from your on-chain transaction, no need to type it.</p>
+                <p className="text-white/60 text-sm mt-1">
+                  {otpStage ? 'Enter the 6-digit code we emailed you to confirm this contribution is yours.' : "Add your name, email and TX hash — the amount is read straight from your on-chain transaction, no need to type it."}
+                </p>
               </div>
-              <form onSubmit={submit} className="space-y-3">
-                <div><Label htmlFor="name" className="text-xs text-white/60">Name or Nickname</Label>
-                  <Input id="name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="e.g. Alex or CryptoDegen" className="mt-1 bg-white/5 border-white/10 rounded-xl" /></div>
-                <div><Label htmlFor="tx" className="text-xs text-white/60">TX Hash (required — this is how we verify your donation)</Label>
-                  <Input id="tx" required value={form.txHash} onChange={(e) => setForm({ ...form, txHash: e.target.value })} placeholder="0x…" className="mt-1 bg-white/5 border-white/10 rounded-xl font-mono text-xs" /></div>
-                <Button type="submit" disabled={submitting} className="w-full rounded-xl bg-gradient-to-r from-sky-500 to-cyan-400 text-navy-950 font-semibold hover:opacity-90 h-11">
-                  {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Add me to the wall'}
-                </Button>
-                <p className="text-[10px] text-white/40 text-center leading-relaxed">Your donation counts toward the goal as soon as it&apos;s verified. Your name appears on the wall after a quick review.</p>
-              </form>
+
+              {verified ? (
+                <div className="rounded-xl bg-emerald-500/10 border border-emerald-400/20 p-5 text-center">
+                  <Check className="w-8 h-8 text-emerald-400 mx-auto mb-2" />
+                  <div className="text-white font-semibold">Verified — thank you!</div>
+                  <div className="text-white/60 text-sm mt-1">A confirmation and a thank-you note are on their way to your inbox.</div>
+                  <Button onClick={startOver} variant="outline" className="mt-4 rounded-xl border-white/15 bg-white/5 hover:bg-white/10 text-white">Add another contribution</Button>
+                </div>
+              ) : otpStage ? (
+                <form onSubmit={submitOtp} className="space-y-3">
+                  <div className="rounded-lg bg-white/5 border border-white/10 px-3 py-2 text-[11px] text-white/60 flex items-center gap-2">
+                    <Mail className="w-3.5 h-3.5 text-sky-300 shrink-0" /> Code sent to <span className="text-white/90 font-medium">{pending.email}</span>
+                  </div>
+                  <div>
+                    <Label htmlFor="otp" className="text-xs text-white/60">6-digit code</Label>
+                    <Input
+                      id="otp" inputMode="numeric" maxLength={6} value={otp}
+                      onChange={(e) => setOtp(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                      placeholder="••••••" className="mt-1 bg-white/5 border-white/10 rounded-xl text-center tracking-[0.5em] font-mono text-lg"
+                    />
+                  </div>
+                  <Button type="submit" disabled={verifying} className="w-full rounded-xl bg-gradient-to-r from-emerald-500 to-teal-400 text-navy-950 font-semibold hover:opacity-90 h-11">
+                    {verifying ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Verify ownership'}
+                  </Button>
+                  <div className="flex items-center justify-between text-[11px] text-white/40">
+                    <button type="button" onClick={startOver} className="hover:text-white/70">← Start over</button>
+                    <button type="button" onClick={resendOtp} disabled={resendCooldown > 0} className="hover:text-white/70 disabled:opacity-40">
+                      {resendCooldown > 0 ? `Resend in ${resendCooldown}s` : 'Resend code'}
+                    </button>
+                  </div>
+                </form>
+              ) : (
+                <form onSubmit={submit} className="space-y-3">
+                  <div><Label htmlFor="name" className="text-xs text-white/60">Name or Nickname</Label>
+                    <Input id="name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="e.g. Alex or CryptoDegen" className="mt-1 bg-white/5 border-white/10 rounded-xl" /></div>
+                  <div><Label htmlFor="email" className="text-xs text-white/60">Gmail / Email (required — we send a code to confirm it's your donation)</Label>
+                    <Input id="email" type="email" required value={form.email} onChange={(e) => setForm({ ...form, email: e.target.value })} placeholder="you@gmail.com" className="mt-1 bg-white/5 border-white/10 rounded-xl" /></div>
+                  <div><Label htmlFor="tx" className="text-xs text-white/60">TX Hash (required — this is how we verify your donation)</Label>
+                    <Input id="tx" required value={form.txHash} onChange={(e) => setForm({ ...form, txHash: e.target.value })} placeholder="0x…" className="mt-1 bg-white/5 border-white/10 rounded-xl font-mono text-xs" /></div>
+                  <Button type="submit" disabled={submitting} className="w-full rounded-xl bg-gradient-to-r from-sky-500 to-cyan-400 text-navy-950 font-semibold hover:opacity-90 h-11">
+                    {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Add me to the wall'}
+                  </Button>
+                  <p className="text-[10px] text-white/40 text-center leading-relaxed">Your donation counts toward the goal as soon as it&apos;s verified. Your name appears on the wall after a quick review.</p>
+                </form>
+              )}
             </CardContent>
           </Card>
         </div>
