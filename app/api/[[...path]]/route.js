@@ -432,6 +432,14 @@ export async function OPTIONS() {
   return applyCors(new NextResponse(null, { status: 204 }));
 }
 
+// Every route here reads live DB state (content, stats, contributors) —
+// nothing in this file should ever be served from Next.js's Route Handler
+// cache. Without this, GET /content (and /stats, /contributors) can get
+// cached at build/first-request time, so admin edits save correctly to
+// Mongo but visitors keep seeing the old response.
+export const dynamic = 'force-dynamic';
+export const revalidate = 0;
+
 // ============================================================
 // Main handler
 // ============================================================
