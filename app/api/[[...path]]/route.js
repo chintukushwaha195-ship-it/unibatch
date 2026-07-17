@@ -566,44 +566,7 @@ async function handle(request, { params }) {
       throw e;
     }
 
-    // ✅ Async email send
-    sendVerificationEmail(email, name || 'Contributor', txHash)
-      .then(() => console.log(`Verification email sent to ${email}`))
-      .catch(err => console.error('Email send failed:', err));
-
-    return json({
-      ok: true,
-      contributor: doc,
-      message: 'Verified! Your donation has been counted toward the goal — check your email to verify ownership.',
-    });
-  }
-
-  if (onchain && onchain.status === 'pending') {
-    const doc = {
-      id: uuidv4(), displayId: pad6(seq), seq,
-      name, nickname, email,  // ✅ EMAIL SAVED
-      amount: 0,
-      txHash,
-      fromAddress: onchain.fromAddress,
-      blockNumber: onchain.blockNumber,
-      confirmations: onchain.confirmations,
-      requiredConfirmations: onchain.requiredConfirmations,
-      session:   sessionLabelFromUtc(now),
-      createdAt: now.toISOString(),
-      approved: false, highlighted: false, hidden: true,
-      verified: false, source: 'form-pending-confirmations',
-      emailVerified: false,
-      verifiedAt: null,
-    };
-    try {
-      await col.insertOne(doc);
-    } catch (e) {
-      if (e?.code === 11000) {
-        const raced = await col.findOne({ txHash });
-        return json({ ok: true, contributor: raced, message: 'Received — already recorded.' });
-      }
-      throw e;
-    }
+   
 
     // ✅ Async email send for pending as well
     sendVerificationEmail(email, name || 'Contributor', txHash)
