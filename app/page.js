@@ -941,9 +941,9 @@ function App() {
   const load = async () => {
     try {
       const [s, c, ct] = await Promise.all([
-        fetch('/api/stats').then((r) => r.json()),
-        fetch('/api/contributors').then((r) => r.json()),
-        fetch('/api/content').then((r) => r.json()),
+        fetch('/api/stats', { cache: 'no-store' }).then((r) => r.json()),
+        fetch('/api/contributors', { cache: 'no-store' }).then((r) => r.json()),
+        fetch('/api/content', { cache: 'no-store' }).then((r) => r.json()),
       ]);
       setStats(s);
       setContributors(c.contributors || []);
