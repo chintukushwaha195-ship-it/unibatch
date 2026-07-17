@@ -628,6 +628,10 @@ function SupportPage({ stats, contributors, refresh, content }) {
                   <Input id="name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} placeholder="e.g. Alex or CryptoDegen" className="mt-1 bg-white/5 border-white/10 rounded-xl" /></div>
                 <div><Label htmlFor="tx" className="text-xs text-white/60">TX Hash (required — this is how we verify your donation)</Label>
                   <Input id="tx" required value={form.txHash} onChange={(e) => setForm({ ...form, txHash: e.target.value })} placeholder="0x…" className="mt-1 bg-white/5 border-white/10 rounded-xl font-mono text-xs" /></div>
+                    <div><Label htmlFor="email" className="text-xs text-white/60">Email Address <span className="text-red-400">*</span></Label>
+                    <Input id="email" name="email" type="email" required placeholder="you@example.com" className="mt-1 bg-white/5 border-white/10 rounded-xl" />
+                    <p className="text-[10px] text-white/40 mt-1">We'll send a verification link to this email.</p>
+                   </div>
                 <Button type="submit" disabled={submitting} className="w-full rounded-xl bg-gradient-to-r from-sky-500 to-cyan-400 text-navy-950 font-semibold hover:opacity-90 h-11">
                   {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : 'Add me to the wall'}
                 </Button>
